@@ -6,6 +6,7 @@ from typing import Optional
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 
@@ -66,6 +67,79 @@ class LangfuseSettings(BaseModel):
     secret_key: str = Field(default_factory=lambda: os.getenv("LANGFUSE_SECRET_KEY", ""))
     host: str = Field(default_factory=lambda: os.getenv("LANGFUSE_HOST", "https://us.cloud.langfuse.com"))
 
+class ChatbotSettings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="CHATBOT_",
+        env_file=".env",
+        extra="ignore",
+    )
+
+    model: str = "openai:gpt-4o"
+    cheap_model: str = "openai:gpt-4o-mini"
+    temperature: float = 0.0
+    max_output_tokens: int = 800
+    max_history_turns: int = 20
+    session_ttl_seconds: int = 3600
+    max_tool_iterations: int = 4
+    request_timeout_seconds: int = 30
+
+class RetrievalSettings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="RETRIEVAL_",
+        env_file=".env",
+        extra="ignore",
+    )
+
+    top_k: int = 5
+    distance_threshold: float = 0.45
+    max_context_tokens: int = 6000
+    metadata_filename_allowlist: Optional[list[str]] = None
+    metadata_filetype_allowlist: list[str] = Field(default_factory=lambda: [".pdf", ".docx"])
+    embedding_cache_ttl_seconds: int = 86400
+
+class GuardrailSettings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="GUARDRAIL_",
+        env_file=".env",
+        extra="ignore",
+    )
+
+    # Input
+    max_input_chars: int = 2000
+    min_input_chars: int = 1
+    block_pii_in_input: bool = True
+    block_jailbreak_attempts: bool = True
+    allowed_languages: list[str] = Field(default_factory=lambda: ["en"])
+    enable_llm_judge: bool = False
+    # Relevance gate
+    relevance_gate_enabled: bool = True
+    relevance_out_of_scope_message: str = (
+        "I can only help with topics covered in my knowledge base. "
+        "Could you rephrase your question or ask something more specific?"
+    )
+    # Output
+    require_citations: bool = True
+    scrub_pii_in_output: bool = True
+    scrub_profanity_in_output: bool = True
+    refuse_when_no_context: bool = True
+    # Conversation / operational
+    max_turns_per_session: int = 50
+    rate_limit_per_minute: int = 30
+
+
+class OpsSettings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="OPS_",
+        env_file=".env",
+        extra="ignore",
+    )
+
+    enable_structured_logs: bool = True
+    enable_rate_limiting: bool = True
+    enable_readiness_probe: bool = True
+    enable_embedding_cache: bool = True
+    enable_otel_tracing: bool = False
+    
 class Settings(BaseModel):
     """Main settings class combining all sub-settings."""
 
@@ -75,6 +149,10 @@ class Settings(BaseModel):
     chunking: ChunkingSettings = Field(default_factory=ChunkingSettings)  
     redis: RedisSettings = Field(default_factory=RedisSettings) 
     langfuse: LangfuseSettings = Field(default_factory=LangfuseSettings)
+    chatbot: ChatbotSettings = Field(default_factory=ChatbotSettings)         
+    retrieval: RetrievalSettings = Field(default_factory=RetrievalSettings)  
+    guardrails: GuardrailSettings = Field(default_factory=GuardrailSettings)  
+    ops: OpsSettings = Field(default_factory=OpsSettings)                     
 
 
 

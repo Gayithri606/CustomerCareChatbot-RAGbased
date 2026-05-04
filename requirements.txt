@@ -14,3 +14,7 @@ uvicorn[standard]
 python-multipart
 celery[redis]
 redis
+pydantic-ai-slim[openai]
+pydantic-settings
+slowapi
+python-json-logger
