@@ -106,8 +106,14 @@ agent: Agent[ChatDeps, ChatAnswer] = Agent(
 default_usage_limits = UsageLimits(
     # Cap the LLM's output token budget per turn. Kept in sync with the
     # model_settings.max_tokens baked into the Agent above.
-    response_tokens_limit=_cs.max_output_tokens,
-    # request_tokens_limit and total_tokens_limit are left unset here;
+    #
+    # Field name note: Pydantic AI 2.x renamed these from
+    # `response_tokens_limit` / `request_tokens_limit` to
+    # `output_tokens_limit` / `input_tokens_limit`. This file originally
+    # targeted the older names; updated when the environment was rebuilt
+    # against pydantic-ai-slim 2.23.0.
+    output_tokens_limit=_cs.max_output_tokens,
+    # input_tokens_limit and total_tokens_limit are left unset here;
     # Phase 10 can add per-session token accounting if needed.
 )
 
