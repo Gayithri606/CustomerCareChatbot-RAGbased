@@ -237,3 +237,78 @@ recycled answer with stale citations) into a visible, safe failure with
 memory. Defense in depth did its job; the agent's laziness on repeated
 questions is a real production scenario (customers re-ask!) and gets its
 own prompt-level fix.
+
+---
+
+## L10. One retry message cannot fit all failures — and what "cheap retry" really costs
+
+Follow-up to L9. The proposed fix for the repeated-question failure was to
+change the grounding ModelRetry message to "Call retrieve_knowledge NOW."
+The review question that improved it: **is that right for every way
+"enough_context=True + zero valid citations" can happen?**
+
+No. Four causes, two different correct instructions:
+
+| Cause | Context present this turn? | Correct instruction |
+|---|---|---|
+| 1. Forgot to populate citations | Yes | Re-read it, cite properly |
+| 2. Mangled/invented chunk IDs | Yes | Re-read it, cite properly |
+| 3. Reused stale IDs from an earlier turn | No | Call the tool now |
+| 4. Never retrieved, answered from history | No | Call the tool now |
+
+The validator can tell the groups apart without guessing:
+`ctx.deps.retrieved_chunk_ids` is empty exactly when no retrieval
+survived this turn. Hence ADR-005: the ModelRetry branches on that check,
+so each failure mode receives the cheapest instruction that can actually
+succeed. (The original message — "re-read the context returned by
+retrieve_knowledge" — was an impossible instruction in cases 3/4, which
+is why the retry failed identically in testing.)
+
+**On "cheap":** a retry always re-runs the full LLM generation — that's
+the dominant cost and happens regardless of wording. The tool call, when
+commanded, adds only: an embedding (~$0.000002, often a cache hit since
+the question repeats), a local vector search (milliseconds), and the
+chunk JSON re-entering context. "Cheap" = one bounded extra attempt, not
+a free one.
+
+Meta-lesson: retry messages are prompts. Write them for the model that
+made the mistake, and make sure the instruction is executable in the
+state the model is actually in.
+
+---
+
+## L11. Do the new system-prompt rule and the branched retry conflict?
+
+Asked before committing ADR-005: the system prompt now says *"you MUST
+call retrieve_knowledge in EVERY turn... never answer from conversation
+history alone"* — but the retry's re-read branch says *"re-read the
+context already returned, don't re-fetch."* Contradiction?
+
+No — they operate at two different moments, and the wording keeps them
+aligned:
+
+- The **system prompt is a standing policy about turns**: retrieve before
+  you answer, once per turn. It governs the first attempt.
+- The **retry message is a situational correction within one turn**, and
+  its two branches agree with the policy:
+  - *"Call the tool NOW"* fires when the model BROKE the standing rule
+    (no retrieval this turn) — the retry enforces the same rule.
+  - *"Re-read, don't re-fetch"* fires when the model FOLLOWED the rule
+    (tool was called this turn) and only botched the citing. "Once per
+    turn" is satisfied; the rule says once, not twice.
+
+The wording trap checked: could this turn's tool output count as
+forbidden "history"? No — both texts draw the same line in the same
+place: **this turn's retrieval = valid; earlier turns = invalid.** The
+retry says "in THIS turn"; the prompt forbids chunk_ids "from earlier
+turns." Consistent vocabulary, no ambiguity.
+
+Worst realistic case is harmless: a cautious model re-calls the tool on a
+re-read retry → same query, same chunks, citations validate. One slightly
+wasteful call, not a failure.
+
+General principle: a system prompt is a standing rule; a retry message is
+an on-the-spot correction from the referee. Models resolve them the way
+an employee resolves "company policy says X" vs "my manager, watching
+right now, says do X-prime for this case" — the specific, most recent
+instruction clarifies the general one.

@@ -10,103 +10,86 @@ what options did we consider, what did we pick, and what does it cost us.
 
 ---
 
-## ADR-001 — Remove the relevance gate; let the agent handle scope
+## ADR-001 — Fix the history-blind relevance gate with query condensation
 
-**Date:** 2026-08-06 · **Status:** Accepted · **Files:** `app/api/routes/chat.py`
+**Date:** 2026-08-06 · **Status:** Accepted · **Files:** `app/chatbot/condenser.py` (new), `app/api/routes/chat.py`
 
-### The problem we hit
+### The problem
 
-The first end-to-end test of `/chat` exposed a bug:
-
-- Turn 1: *"What CFM do I need for a range hood?"* → answered correctly, with citations.
-- Turn 2: *"And what about ductwork for that?"* → **refused** as out-of-scope.
-
-The relevance gate embeds only the current message and checks the distance to
-the nearest chunk. The words "and what about ductwork for that?" carry almost
-no meaning on their own — "that" refers to the range hood, but only the
-conversation history knows this, and the gate never sees the history. The gate
-was designed in Phase 4, when the chatbot had no memory. Multi-turn memory
-arrived in Phase 8. The two features were built on different assumptions and
-collided the first time they ran in the same request.
-
-**Impact:** natural follow-up questions — the whole point of a multi-turn
-chatbot — were being refused. The gate defeated the headline feature.
+First end-to-end test of `/chat`: turn 1 ("What CFM do I need for a range
+hood?") answered correctly; turn 2 ("And what about ductwork for that?")
+was wrongly refused as out-of-scope. The relevance gate embeds only the
+current message — "that" is meaningless without history, which the gate
+never sees. The gate was built in Phase 4 (no memory existed); memory
+arrived in Phase 8; the collision surfaced the first time both ran in one
+request. As shipped, the gate defeated multi-turn conversation.
 
 ### Options considered
 
 | Option | Idea | Verdict |
 |---|---|---|
-| A — Skip gate when history exists | One `if` statement; follow-ups bypass the gate | Works, free, but off-topic questions mid-conversation are no longer refused cheaply — and the gate remains a second retrieval philosophy bolted onto an agentic design |
-| B — Query condensation | A cheap model (`gpt-4o-mini`) rewrites the follow-up into a standalone question using history; gate and retrieval both use the rewrite | The classic "history-aware retriever" pattern. Correct, but adds a per-turn LLM call, a new prompt to maintain, and a new failure mode (the rewrite can distort the question) |
-| C — Embed last message + current together | Concatenate before embedding | Crude; the combined embedding is an average of two questions and lands close to neither |
-| **D — Remove the gate entirely** | Trust the agent and the downstream guards | **Chosen** |
+| A — Skip gate when history exists | One `if`; follow-ups bypass the gate | Free, but off-topic questions mid-conversation lose their cheap refusal |
+| **B — Query condensation** | Cheap model rewrites the follow-up into a standalone question using history; gate embeds the rewrite | **Chosen** |
+| C — Embed last + current message together | Concatenate before embedding | Crude; the blended embedding lands close to neither question |
+| D — Remove the gate | Rely on downstream retrieval guards + NO_CONTEXT off-ramp | Seriously considered — see below |
 
-### The debate, in short
+### The debate
 
-Three realizations drove the decision:
+Option D was nearly chosen, on three arguments: (1) the gate's safety job
+is duplicated downstream (retrieval guards → NO_CONTEXT → output
+off-ramp); (2) in an agentic design the agent already condenses — it
+reads history and forms its own tool queries; (3) the condenser taxes
+every turn to save cost on off-topic turns.
 
-1. **The gate's safety job is already done downstream.** Retrieval guards drop
-   chunks beyond the distance threshold; the tool returns `NO_CONTEXT` when
-   nothing survives; the output guard then serves the canned "I don't have
-   information on that" off-ramp. The gate was an *optimization* (refuse
-   off-topic messages before paying for a GPT-4o call), not a correctness
-   mechanism.
-
-2. **A Redis embedding cache would not have saved it.** The cache fixes the
-   *cost* of the gate (duplicate embedding), not its *correctness* (history
-   blindness). A cached wrong refusal is still a wrong refusal. Also, the
-   cache keys on exact text — the gate embeds the customer's raw words while
-   the agent searches with its own rephrasing, so gate/tool cache hits would
-   be rare anyway.
-
-3. **In an agentic design, the agent IS the condenser.** This was the
-   deciding insight. We chose Pydantic AI with `retrieve_knowledge` as a
-   tool precisely so the LLM forms its own search queries. On a follow-up
-   turn, GPT-4o reads the history, resolves "that" to "range hood", and
-   calls `retrieve_knowledge("range hood ductwork requirements")` on its
-   own. Option B would have paid a second model to do a job the main model
-   already does. The gate was classic-RAG thinking (retrieve once, up
-   front) living inside an agentic architecture — the mismatch, not the
-   gate's code, was the real bug.
+What reversed it was the production lens. In real customer-facing
+deployments, off-topic traffic is not rare — greetings, chitchat,
+probing, venting, and spam are a large minority of messages. Production
+systems keep a cheap pre-LLM scope check for exactly this reason, and the
+standard shape of that check is condense-then-gate ("history-aware
+retrieval"). Removing the gate would have optimized for the demo, not the
+deployment the project claims to mimic. Decision principle: build the
+production pattern and document it, rather than take the shortcut.
 
 ### Decision
 
-Remove the relevance gate call from the `/chat` route. Out-of-scope handling
-is delegated to the layers that already do it: retrieval guards →
-`NO_CONTEXT` sentinel → output-guard soft off-ramp. The `relevance_gate`
-function remains in `input_guards.py` (unused, harmless, and removing
-committed guardrail code is a separate decision).
+Option B. A new `condenser.py` module uses `cheap_model` (gpt-4o-mini) to
+rewrite follow-ups into standalone questions; the gate embeds the
+rewrite. First turns skip condensation (nothing to resolve). The
+condenser fails open — on any error the raw message is used, so a broken
+condenser can never block the chat surface. The agent still receives the
+raw message plus full history; the rewrite exists only for the gate's
+embedding, so a distorted rewrite can cause at worst a wrong gate
+verdict, never a wrong answer in the customer's name.
 
 ### Pros
 
-- Follow-up questions work on every turn — the bug is gone by subtraction,
-  not by adding machinery.
-- One less concept, one less threshold to tune, no duplicate
-  embed-and-search on every allowed turn.
-- No new failure modes (option B's rewrite-distortion risk never enters the
-  system).
-- The design becomes internally consistent: one retrieval philosophy
-  (agentic) instead of two.
+- Follow-ups pass the gate; multi-turn works on every turn.
+- Off-topic messages are still refused before the expensive model —
+  including mid-conversation.
+- Matches the production-standard pattern; `cheap_model` (configured
+  since Phase 1, never used) finally earns its place.
 
 ### Cons — accepted knowingly
 
-- An off-topic question now costs one GPT-4o call (~$0.01) before being
-  refused, instead of ~$0.000002. Accepted because off-topic messages are
-  rare in this deployment, and the refusal itself still happens reliably.
-- No cheap pre-LLM scope filter exists anymore. If abuse or cost ever
-  becomes real, the right re-introduction is option B (condense, then gate)
-  — documented here so future-us doesn't reinvent the debate.
+- Every follow-up turn pays one cheap-model call (~$0.0001, ~300ms).
+- The rewrite can distort intent; mitigated by first-turn skip,
+  fail-open, a strict "never add details" prompt, and by never feeding
+  the rewrite to the answering agent.
 
 ### Learnings
 
-- **When two features are built in different phases, re-test the older one's
-  assumptions.** The gate was correct in Phase 4 and wrong by Phase 8;
-  nothing forced the collision until the route ran both in one request.
-- **Ask what job a component actually does before fixing it.** Every fix
-  (A, B, C) assumed the gate must stay. The best fix was noticing its job
-  was already covered.
-- **Caching fixes cost, never correctness.** "Would the cache save it?" was
-  the right question to ask — and the answer clarified everything.
+- When two features are built in different phases, re-test the older
+  one's assumptions against the newer one.
+- Caching fixes cost, never correctness — "would a cache save it?" was
+  the clarifying question.
+- Decide for the system you claim to be building. The demo said "remove
+  it"; the production story said "fix it properly." We chose the latter,
+  on purpose.
+- (Meta) This entry was first drafted recording option D as accepted,
+  before the decision was truly final — and was even committed in that
+  state, so for a few commits the decision log contradicted the code.
+  Rewritten. Log decisions when they are decided, not while they are
+  leaning.
 
 ---
 
@@ -121,16 +104,23 @@ route. Scheduled after ADR-001 is implemented and verified.
 
 ---
 
-## ADR-003 — Shared `document_embeddings` table across projects *(pending)*
+## ADR-003 — Shared dev database, table name to become configurable
 
-**Status:** Open, accepted for now. This project and
-DocumentProcessingPipeline-RAGbased share one TimescaleDB container and the
-same hardcoded `document_embeddings` table. Kept shared during Phase 10
-bring-up (one variable at a time; the existing data was useful for testing).
-Planned fix: make `VectorStoreSettings.table_name` env-driven, point this
-project at its own `customercare_embeddings` table, re-ingest
-customer-care-appropriate documents. Redis needs no change — keys are
-already namespaced under `chatbot:*`.
+**Status:** Accepted for development · **Files:** `app/config/settings.py`
+
+This project currently shares one local TimescaleDB container and the
+hardcoded `document_embeddings` table with a sibling learning project.
+This is a development-environment convenience, not a production design:
+it kept Phase 10 bring-up to one moving variable and reused already-
+ingested documents for testing. Not applicable to any real deployment,
+where the service would own its database.
+
+The one real code item hiding here: `VectorStoreSettings.table_name` is a
+hardcoded literal while every other setting is env-driven. Future chore
+(not a decision): make it configurable via env var (e.g.
+`VECTOR_STORE_TABLE_NAME`), point this project at its own table, and
+re-ingest customer-care-appropriate documents. Redis needs no change —
+keys are already namespaced under `chatbot:*`.
 
 ---
 
@@ -245,3 +235,76 @@ immune to inheriting the wrong job description.
 - Control channel vs data channel is the lens: instructions in the system
   slot are obeyed; instructions quoted in data are (mostly) just read.
   Prompt injection is the exploitation of "mostly".
+
+---
+
+## ADR-005 — Grounding retry message branches on whether retrieval happened this turn
+
+**Date:** 2026-08-07 · **Status:** Accepted · **Files:** `app/chatbot/agent.py`, `app/chatbot/prompts.py` · **Companion to:** learnings L9, L10
+
+### Context
+
+Verification of ADR-001 exposed a repeated-question failure: on a
+word-for-word repeat, the agent skipped `retrieve_knowledge`, recited its
+earlier answer, and cited stale chunk IDs from the previous turn. The
+output validator correctly dropped the citations and fired its one
+`ModelRetry` — but the retry failed identically, because the retry
+message said *"re-read the context returned by retrieve_knowledge"* when
+no retrieval had happened. There was nothing to re-read.
+
+### The brainstorm that shaped the fix
+
+The first proposed fix replaced the message with *"Call retrieve_knowledge
+NOW."* Review challenge (the decisive question): **is commanding a tool
+call correct for every way this failure arises?** Enumerating the causes
+of `enough_context=True` + zero valid citations:
+
+1. Model retrieved, answered well, **forgot to populate citations**.
+2. Model retrieved but **mangled/invented chunk IDs**.
+3. Model cited **stale IDs from an earlier turn**.
+4. Model **never retrieved at all** and answered from history/priors.
+
+For cases 1–2 the retrieved context is already in the conversation —
+*re-read and cite* is the correct, cheaper instruction; forcing a fresh
+tool call re-fetches what the model already has. For cases 3–4 there is
+no current context — *call the tool* is the only instruction that can
+succeed. One fixed message is therefore wrong in one direction or the
+other.
+
+### Decision
+
+The validator can distinguish the cases: `ctx.deps.retrieved_chunk_ids`
+is empty exactly when no retrieval survived this turn. So the
+`ModelRetry` branches:
+
+- **Empty set** (cases 3–4): command the model to call
+  `retrieve_knowledge` now, then cite from its output or honestly set
+  `enough_context=False`.
+- **Non-empty set** (cases 1–2): command the model to re-read THIS
+  turn's already-returned context and cite exact chunk_ids from it —
+  no re-fetch.
+
+Companion change in `prompts.py`: the system prompt now mandates calling
+`retrieve_knowledge` every turn and forbids reusing chunk_ids from
+earlier turns, reducing how often the retry is needed at all.
+
+### Cost clarification (recorded because it was a point of confusion)
+
+A retry always re-runs the full LLM generation — that is the dominant
+cost (~1 cent, seconds) and is unavoidable. "Cheap retry" means one
+bounded extra attempt versus losing a good answer or retrying without
+limit. The marginal cost of a commanded tool call on top of that is
+small: the query embedding is ~free (often an ADR-cache hit), vector
+search is local milliseconds; the only real addition is the chunk JSON
+re-entering the context. The branching also minimizes this: the re-read
+path skips even that.
+
+### Learnings
+
+- Error messages to an LLM are instructions, not diagnostics: an
+  instruction the model cannot execute ("re-read" what doesn't exist)
+  produces an identical failure, burning the retry budget.
+- When a validator can observe which failure mode occurred, give each
+  mode its own targeted correction rather than one generic message.
+- The review question "is this fix right for ALL the ways the bug
+  happens?" upgraded the fix from workable to correct.
