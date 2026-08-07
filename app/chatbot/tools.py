@@ -39,7 +39,13 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import TYPE_CHECKING
+
+# Runtime import, NOT a `if TYPE_CHECKING:` guard. Pydantic AI calls
+# `typing.get_type_hints()` on every registered tool function while the
+# Agent is being constructed, which evaluates these annotations for real.
+# Under a TYPE_CHECKING guard the name is absent at runtime and
+# `Agent(...)` dies with `NameError: name 'RunContext' is not defined`.
+from pydantic_ai import RunContext
 
 from chatbot.deps import ChatDeps
 from chatbot.guardrails.retrieval_guards import (
@@ -47,16 +53,13 @@ from chatbot.guardrails.retrieval_guards import (
     apply_retrieval_guards,
 )
 
-if TYPE_CHECKING:
-    from pydantic_ai import RunContext
-
 logger = logging.getLogger(__name__)
 
 
 # --- Tool 1: retrieve_knowledge ---------------------------------------------
 
 async def retrieve_knowledge(
-    ctx: "RunContext[ChatDeps]",
+    ctx: RunContext[ChatDeps],
     query: str,
 ) -> str:
     """Retrieve and guard knowledge-base chunks most relevant to `query`.
@@ -117,7 +120,7 @@ async def retrieve_knowledge(
 # --- Tool 2: escalate_to_human ----------------------------------------------
 
 async def escalate_to_human(
-    ctx: "RunContext[ChatDeps]",
+    ctx: RunContext[ChatDeps],
     reason: str,
 ) -> str:
     """Signal that this turn should be handed off to a human agent.

@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from config.settings import get_settings
-from api.routes import ingest, query, documents ,jobs
+from api.routes import ingest, query, documents ,jobs, chat
 
 get_settings()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -30,6 +30,7 @@ app.include_router(ingest.router)
 app.include_router(query.router)
 app.include_router(documents.router)
 app.include_router(jobs.router)
+app.include_router(chat.router) 
 
 
 @app.get("/health", tags=["health"])

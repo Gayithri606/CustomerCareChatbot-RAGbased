@@ -106,8 +106,14 @@ agent: Agent[ChatDeps, ChatAnswer] = Agent(
 default_usage_limits = UsageLimits(
     # Cap the LLM's output token budget per turn. Kept in sync with the
     # model_settings.max_tokens baked into the Agent above.
-    response_tokens_limit=_cs.max_output_tokens,
-    # request_tokens_limit and total_tokens_limit are left unset here;
+    #
+    # Field name note: Pydantic AI 2.x renamed these from
+    # `response_tokens_limit` / `request_tokens_limit` to
+    # `output_tokens_limit` / `input_tokens_limit`. This file originally
+    # targeted the older names; updated when the environment was rebuilt
+    # against pydantic-ai-slim 2.23.0.
+    output_tokens_limit=_cs.max_output_tokens,
+    # input_tokens_limit and total_tokens_limit are left unset here;
     # Phase 10 can add per-session token accounting if needed.
 )
 
@@ -188,15 +194,29 @@ async def _validate_and_guard_output(
     # stage 1 filtering. Distinct from enough_context_false: the LLM
     # judged it had enough context but failed to back it up — correctable.
     if "grounding" in result.flagged_stages:
+        if not ctx.deps.retrieved_chunk_ids:
+            # No retrieval happened this turn — the model answered from
+            # history or priors. There is no context to re-read; it must
+            # call the tool. (Learnings L9: the repeated-question case.)
+            raise ModelRetry(
+                "Your response set enough_context=True, but retrieve_knowledge "
+                "was not called this turn, so there is no current context to "
+                "cite. Call retrieve_knowledge NOW with the user's question. "
+                "Then cite chunk_id values from its output — or, if it does "
+                "not support a grounded answer, set enough_context=False "
+                "with empty citations."
+            )
+        # Retrieval DID happen — the model mis-cited (forgot, typo'd, or
+        # reused stale IDs). Cheaper correction: re-read, don't re-fetch.
         raise ModelRetry(
-            "Your response set enough_context=True but cited no chunks from "
-            "the retrieved context (all cited chunk_ids were absent or invalid). "
-            "Re-read the context returned by retrieve_knowledge and populate "
-            "'citations' with valid chunk_id values from it. "
-            "If the context does not support a grounded answer, set "
-            "enough_context=False and leave citations empty."
+            "Your response set enough_context=True but none of your cited "
+            "chunk_ids match this turn's retrieved context. Re-read the "
+            "context already returned by retrieve_knowledge in THIS turn "
+            "and populate 'citations' with exact chunk_id values from it. "
+            "Never reuse chunk_ids from earlier turns. If the context does "
+            "not support a grounded answer, set enough_context=False and "
+            "leave citations empty."
         )
-
     # Merge all guard transforms into the returned ChatAnswer.
     # result.answer has: filtered citations (stage 1) + scrubbed answer body
     # (stages 4, 5 applied to answer.answer in apply_output_guards).

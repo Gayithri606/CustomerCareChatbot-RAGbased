@@ -13,7 +13,7 @@ from langfuse import observe
 class VectorStore:
     """A class for managing vector operations and database interactions."""
 
-    def __init__(self):
+    def __init__(self, embedding_cache=None):
         """Initialize the VectorStore with settings, OpenAI client, and Timescale Vector client."""
         self.settings = get_settings()
         self.openai_client = OpenAI(api_key=self.settings.openai.api_key)
@@ -32,6 +32,13 @@ class VectorStore:
             self.vector_settings.embedding_dimensions,
             time_partition_interval=self.vector_settings.time_partition_interval,
         )
+        # Optional async embedding cache, injected by the chat route
+        # (duck-typed: needs async get(text, model) / set(text, model,
+        # embedding) — see app/chatbot/cache.py). Injected rather than
+        # imported: database/ must not import from chatbot/ (layering
+        # rule, docs/architecture.md). None = no caching, original
+        # behavior — all existing VectorStore() call sites are unaffected.
+        self.embedding_cache = embedding_cache
 
     @observe()
     def get_embedding(self, text: str) -> List[float]:
@@ -83,6 +90,16 @@ class VectorStore:
     @observe()
     async def get_embedding_async(self, text: str) -> List[float]:
         text = text.replace("\n", " ")
+
+        # Cache check before the OpenAI call (Phase 8 EmbeddingCache,
+        # wired in Phase 10). Key includes the model name, so a model
+        # swap can never serve stale vectors.
+        if self.embedding_cache is not None:
+            cached = await self.embedding_cache.get(text, self.embedding_model)
+            if cached is not None:
+                logging.info("Embedding cache hit")
+                return cached
+
         start_time = time.time()
         embedding = (
             await self.async_openai_client.embeddings.create(
@@ -92,6 +109,10 @@ class VectorStore:
         ).data[0].embedding
         elapsed_time = time.time() - start_time
         logging.info(f"Embedding generated in {elapsed_time:.3f} seconds")
+
+        if self.embedding_cache is not None:
+            await self.embedding_cache.set(text, self.embedding_model, embedding)
+
         return embedding
 
     def create_tables(self) -> None:
