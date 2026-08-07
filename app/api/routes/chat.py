@@ -11,6 +11,7 @@ the last, so the earliest possible refusal is always the cheapest):
     2. Input guards             pure regex, no network, no cost
     3. Session memory load      one Redis GET
     4. Conversation cap         max_turns_per_session (Guardrail F)
+    4.5 Query condensation      cheap-model rewrite of follow-ups (ADR-001)
     5. Relevance gate           one embed + one top-1 vector lookup
     6. Agent run                the only LLM call; tools + output validator
     7. Escalation override      deterministic keyword trigger (Q-D trigger 1)
@@ -71,6 +72,8 @@ from fastapi import APIRouter
 from pydantic_ai.exceptions import UnexpectedModelBehavior, UsageLimitExceeded
 
 from chatbot.agent import agent, default_usage_limits
+from chatbot.cache import EmbeddingCache
+from chatbot.condenser import condense_query
 from chatbot.deps import ChatDeps
 from chatbot.guardrails.input_guards import (
     evaluate_input,
@@ -94,20 +97,30 @@ router = APIRouter(prefix="/chat", tags=["chat"])
 
 _settings = get_settings()
 
-vector_store = VectorStore()
+# decode_responses=False: ModelMessagesTypeAdapter.validate_json accepts
+# bytes, and EmbeddingCache stores JSON. Keeping raw bytes avoids a
+# decode/encode round-trip on every turn.
+redis_client = aioredis.from_url(_settings.redis.url, decode_responses=False)
+
+# Embedding cache (built Phase 8, wired here). The enable_embedding_cache
+# flag is honored at this call site per cache.py's design note: when off,
+# VectorStore receives None and behaves exactly as before. Injected into
+# VectorStore rather than imported by it — database/ must not import from
+# chatbot/ (layering rule, docs/architecture.md).
+embedding_cache = (
+    EmbeddingCache(redis_client, _settings.retrieval)
+    if _settings.ops.enable_embedding_cache
+    else None
+)
+
+vector_store = VectorStore(embedding_cache=embedding_cache)
 
 policy: GuardrailPolicy = GuardrailPolicy.from_settings(
     guardrails=_settings.guardrails,
     retrieval=_settings.retrieval,
 )
 
-# decode_responses=False: ModelMessagesTypeAdapter.validate_json accepts
-# bytes, and EmbeddingCache stores JSON. Keeping raw bytes avoids a
-# decode/encode round-trip on every turn.
-redis_client = aioredis.from_url(_settings.redis.url, decode_responses=False)
-
 memory = ConversationMemory(redis_client, _settings.chatbot)
-
 
 # ---------------------------------------------------------------------------
 # Deterministic escalation keywords (Q-D trigger 1, Decision E3)
@@ -208,8 +221,20 @@ async def chat(request: ChatRequest) -> ChatResponse:
             refused_reason="conversation_guard:session_cap",
         )
 
-    # --- Stage 5: relevance gate (Decision E2) -----------------------------
-    gate = await relevance_gate(message, vector_store, policy)
+    
+    # --- Stage 4.5: condense follow-ups into standalone queries (ADR-001) --
+    # The gate embeds a single message; pronoun follow-ups ("what about
+    # ductwork for that?") embed as noise and get wrongly refused. The
+    # condenser rewrites them using history (see ADR-004 for why it takes
+    # a rendered transcript, not message_history). First turns skip the
+    # call. The AGENT still receives the raw message + full history — the
+    # condensed form exists only for the gate's embedding.
+    condensed_query = message
+    if policy.relevance_gate_enabled and history:
+        condensed_query = await condense_query(message, history)
+
+    # --- Stage 5: relevance gate (Decision E2, ADR-001) --------------------
+    gate = await relevance_gate(condensed_query, vector_store, policy)
     if not gate.allowed and policy.refuse_when_no_context:
         logger.info(
             "chat_refused_relevance session_id=%s best_distance=%s reason=%s",
