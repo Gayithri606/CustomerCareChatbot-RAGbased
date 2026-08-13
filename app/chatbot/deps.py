@@ -31,6 +31,7 @@ from typing import Optional
 
 from chatbot.guardrails.policy import GuardrailPolicy
 from database.vector_store import VectorStore
+from chatbot.guardrails.retrieval_guards import RetrievedChunk
 
 
 @dataclass(slots=True)
@@ -56,3 +57,4 @@ class ChatDeps:
     session_id: str
     user_id: Optional[str] = None
     retrieved_chunk_ids: frozenset[str] = field(default_factory=frozenset)
+    retrieved_chunks: tuple[RetrievedChunk, ...] = ()

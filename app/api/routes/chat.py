@@ -352,6 +352,20 @@ async def chat(request: ChatRequest) -> ChatResponse:
         needs_human,
     )
 
+    # --- Stage 8.5: backfill citation source/score (ADR-002) ---------------
+    # The LLM only sees chunk_ids; filename and distance live on the
+    # RetrievedChunk objects the tool wrote onto deps. Surviving citations
+    # are guaranteed to be in this turn's set; .get() is belt-and-braces.
+    _chunk_by_id = {c.chunk_id: c for c in deps.retrieved_chunks}
+    enriched_citations = []
+    for citation in answer.citations:
+        chunk = _chunk_by_id.get(citation.chunk_id)
+        if chunk is not None:
+            citation = citation.model_copy(
+                update={"source": chunk.filename, "score": chunk.distance}
+            )
+        enriched_citations.append(citation)
+
     # --- Stage 9: respond ---------------------------------------------------
     # `answer.answer` is already the guard-processed body: the output
     # validator in agent.py returned `result.final_body`, which is either
@@ -360,7 +374,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
     return ChatResponse(
         session_id=session_id,
         answer=answer.answer,
-        citations=answer.citations,
+        citations=enriched_citations,
         enough_context=answer.enough_context,
         needs_human=needs_human,
         refused_reason=None,

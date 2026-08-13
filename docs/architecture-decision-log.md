@@ -93,14 +93,25 @@ verdict, never a wrong answer in the customer's name.
 
 ---
 
-## ADR-002 — Citation source/score backfill *(pending)*
+## ADR-002 — Citation source/score backfill
 
-**Status:** Open. Citations currently return `"source": null, "score": null`
-— the LLM cites `chunk_id`s, but the route can't map them back to filenames
-because `ChatDeps` carries only the surviving chunk IDs, not the chunk
-bodies. Fix requires an additive change to `deps.py` + `tools.py` (store the
-surviving chunks, not just their IDs) and a small backfill loop in the
-route. Scheduled after ADR-001 is implemented and verified.
+**Date:** 2026-08-13 · **Status:** Accepted, implemented · **Files:** `app/chatbot/deps.py`, `app/chatbot/tools.py`, `app/api/routes/chat.py`
+
+Citations returned `"source": null, "score": null` — the LLM cites
+`chunk_id`s (all it sees), and the route could not map them back to
+filenames because `ChatDeps` carried only the surviving chunk IDs, not
+the chunk objects holding filename and distance.
+
+**Fix (carry the chunks, not just their IDs):** `ChatDeps` gained
+`retrieved_chunks: tuple[RetrievedChunk, ...]` alongside the existing
+`retrieved_chunk_ids` (whose output-guard contract stays untouched);
+`retrieve_knowledge` writes both; the route's new Stage 8.5 enriches
+each surviving citation with the chunk's filename and distance via
+`model_copy` before responding. Safe by construction: the output
+validator guarantees every surviving citation is in this turn's
+retrieved set, so the lookup cannot miss. Resolves route Decision E4.
+
+Verified: citations now return real filenames and distance scores.
 
 ---
 

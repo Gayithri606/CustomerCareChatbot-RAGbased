@@ -103,6 +103,8 @@ async def retrieve_knowledge(
     # frozenset(...) replacement keeps the type contract on
     # `ChatDeps.retrieved_chunk_ids` intact.
     deps.retrieved_chunk_ids = frozenset(c.chunk_id for c in result.chunks)
+    # Full chunk objects for the route's citation backfill (ADR-002).
+    deps.retrieved_chunks = tuple(result.chunks)
 
     logger.info(
         "tool_retrieve_knowledge survived=%d total_tokens=%d dropped=%s",
