@@ -312,3 +312,156 @@ an on-the-spot correction from the referee. Models resolve them the way
 an employee resolves "company policy says X" vs "my manager, watching
 right now, says do X-prime for this case" — the specific, most recent
 instruction clarifies the general one.
+
+---
+
+## L12. What "industry-standard logging" actually means, and how much of it we can do here
+
+Asked before starting the Phase 10 structured-logging unit: *"JSON logs are
+industry standard — but what IS the standard, and can we do it here?"*
+
+It is not one thing. It is eight practices, and they have different answers:
+
+| # | Practice | Verdict here |
+|---|---|---|
+| 1 | Structured events as JSON Lines (one object per line) | Yes — `python-json-logger` already pinned |
+| 2 | Log to stdout only; never write or rotate files (Twelve-Factor XI) | Already true — uvicorn → stdout → `docker logs` |
+| 3 | Stable schema on every line: `timestamp` (ISO-8601 UTC), `level`, `logger`, `event`, plus `service` / `version` / `env` | Yes |
+| 4 | Correlation id per request, honoring an inbound `X-Request-ID` | Yes — `ContextVar` + middleware |
+| 5 | Event name + fields, not prose sentences (`logger.info("chat_turn_ok", extra={...})`) | Yes |
+| 6 | **Canonical log line / "wide event"** — ONE rich summary event per request | Yes, and highest value for us (see below) |
+| 7 | Never log secrets, payloads, or PII | One violation found (see below) |
+| 8 | Aggregation, indexing, retention, alerting (Loki / ELK / CloudWatch / Datadog) | **No — needs infrastructure we don't have** |
+
+### The Python specifics
+
+The conventional Python answer is **stdlib `logging`, configured once via
+`logging.config.dictConfig`, with a JSON formatter**. `dictConfig` is the
+standard because it is declarative and configures *every* logger in one
+statement — including uvicorn's `uvicorn.access` / `uvicorn.error`, which
+otherwise keep printing plain text alongside our JSON and produce a mixed,
+unparseable stream.
+
+`structlog` is the modern alternative (processor pipeline, native context
+binding). Not chosen: `python-json-logger` is already in
+`requirements.lock.txt`, and stdlib logging done properly is the more
+transferable skill.
+
+### Why the canonical log line matters to us specifically
+
+One `/chat` turn currently scatters ~10 log lines across `chat.py`,
+`condenser.py`, `tools.py`, `retrieval_guards.py`, `output_guards.py`, and
+`memory.py`. L9 records the consequence: working out how many LLM
+generations had run required counting `output_guards` blocks by timestamp
+*by hand*. A single wide event at the end of the turn —
+
+    {"event":"chat_turn","request_id":"3f9c…","session_id":"a1b2…",
+     "duration_ms":4210,"outcome":"ok","generations":2,"retried":true,
+     "gate_distance":0.31,"retrieval_survived":4,"citations":2}
+
+— answers that question with one grep. The per-stage lines stay for detail;
+the wide event is what gets read day to day.
+
+### Two findings from the audit
+
+1. **`main.py`'s logging config was dead code.** Logging was configured
+   twice: `get_settings()` → `settings.setup_logging()` →
+   `logging.basicConfig(...)`, and then again directly in `main.py`.
+   `basicConfig` only configures the ROOT logger and **silently no-ops when
+   the root logger already has handlers** (absent `force=True`). So the
+   format in effect came from `settings.py`; the `main.py` call did nothing.
+   Two configs, one silently ignored — the kind of thing that produces a
+   long "why isn't my format changing?" session later. `dictConfig`
+   collapses both into one declaration.
+
+2. **`condenser.py` logged raw customer messages.**
+   `logger.info("condensed_query original=%r condensed=%r", message, condensed)`
+   wrote the customer's verbatim text into the log stream at INFO. It was
+   the only such line in the codebase — every other call logs identifiers,
+   categories, counts, and distances. Partly mitigated by our own ordering
+   (input guards fail closed on PII at Stage 2, before condensation at
+   Stage 4.5), but PII detection is regex and therefore best-effort, and
+   retaining full customer utterances in logs is a data-retention decision
+   regardless. Standard treatment: drop to DEBUG, or log a length/hash
+   instead of the text.
+
+### What we cannot do locally, and how to be honest about it
+
+Practice 8 needs a log shipper and a backend that indexes fields so you can
+query `event="chat_turn" AND outcome!="ok"`. On a laptop, JSON logs land in
+a terminal where they are genuinely *harder* to read than plain text. Hence
+the standard resolution, which `OpsSettings.enable_structured_logs` already
+anticipated: **console format in development, JSON in production**, one env
+var apart.
+
+README wording should therefore be "emits structured JSON logs suitable for
+ingestion by a log aggregator" — not "centralized logging", which we have
+not built.
+
+### General principle
+
+"Industry standard" is rarely a single artifact you either have or lack. It
+is a list of practices with different costs; the engineering judgment is
+knowing which ones your environment can actually support, doing those
+properly, and describing the rest accurately rather than aspirationally.
+
+---
+
+## L13. A lazy import can hide a broken dependency for months
+
+Found while building `/readyz`. Adding `import psycopg` at the top of
+`main.py` crashed the app instantly:
+
+    ImportError: no pq wrapper available.
+    - couldn't import psycopg 'c' implementation: No module named 'psycopg_c'
+    - couldn't import psycopg 'binary' implementation: No module named 'psycopg_binary'
+    - couldn't import psycopg 'python' implementation: libpq library not found
+
+`psycopg==3.3.4` is installed, but psycopg 3 is only a wrapper — it needs a
+libpq backend from `psycopg[binary]`, `psycopg[c]`, or a system libpq. None
+is present in this venv.
+
+**The part worth remembering:** this was already broken, and the codebase
+was hiding it. `vector_store.py` imports psycopg **inside**
+`list_documents()` (line ~304), not at module scope:
+
+```python
+async def list_documents(self) -> List[dict]:
+    ...
+    import psycopg          # ← executed only when this function is called
+```
+
+A module-level import runs once, at startup, and fails loudly. A
+function-level import runs only when something calls that function — so
+`GET /documents` has been raising ImportError while the app started
+normally and `/chat` worked perfectly. My top-level import didn't create
+the bug; it moved the failure from "one endpoint, when used" to "the whole
+app, at startup", which is why it surfaced.
+
+**Three drivers, one database.** `requirements.lock.txt` currently pins
+`asyncpg==0.31.0`, `psycopg==3.3.4`, and `psycopg2==2.9.12` — three Postgres
+drivers for one database, only two of which work. `timescale_vector` pulls
+in asyncpg (async client) and psycopg2 (sync client); psycopg 3 was added by
+hand for `list_documents()`.
+
+**Resolution for `/readyz`:** use `asyncpg`. It is already installed, and it
+is the driver the `/chat` vector search actually runs on — so the probe
+tests the connection path the service really serves with, rather than a
+second path that could pass while the real one is broken.
+
+**Still open (not fixed by this unit):** `GET /documents` remains broken.
+Either `pip install "psycopg[binary]"` and refresh the lock file, or rewrite
+`list_documents()` on asyncpg and drop psycopg 3 entirely. The second is the
+Phase 12 cleanup answer — fewer drivers, one connection story.
+
+### General principles
+
+- **Module-level imports are a startup smoke test.** Every import at the top
+  of a file is checked the moment the app boots. Imports hidden inside
+  functions defer that check to whenever someone happens to call the
+  function — which, for a rarely used endpoint, can be never.
+- A lazy import is justified for genuinely optional or slow dependencies,
+  and should say so in a comment. An unexplained one usually means "this was
+  a circular-import workaround" or "nobody thought about it".
+- "It's in the lock file" proves a package is installed, not that it can
+  load. Pinning and importing are different guarantees.
