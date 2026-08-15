@@ -319,3 +319,115 @@ path skips even that.
   mode its own targeted correction rather than one generic message.
 - The review question "is this fix right for ALL the ways the bug
   happens?" upgraded the fix from workable to correct.
+
+---
+
+## ADR-006 — Split liveness and readiness; readiness checks only what we own
+
+**Date:** 2026-08-14 · **Status:** Accepted, implemented · **Files:** `app/main.py`, `README.md`
+
+### The problem
+
+`/health` returned `{"status":"ok"}` whenever the Python process was alive —
+including when Redis and TimescaleDB were both unreachable and every
+`POST /chat` would fail. One endpoint was being asked to answer two
+different operational questions.
+
+### Options considered
+
+| Option | Idea | Verdict |
+|---|---|---|
+| A | Extend `/health` to check dependencies | Rejected — conflates the two questions (see below) |
+| **B** | **Add `/readyz`; leave `/health` as pure liveness** | **Chosen** |
+| C | `/readyz` checking Redis + DB + OpenAI | Rejected — see "what is deliberately not checked" |
+| D | Bare 200/503 with no body | Rejected — a red light that can't say which bulb blew |
+
+### Why the split matters
+
+The two probes tell an orchestrator to do opposite things:
+
+- **Liveness** (`/health`) — "is this process alive?" A failure means
+  **restart the container.**
+- **Readiness** (`/readyz`) — "can this process serve a request right now?"
+  A failure means **route traffic elsewhere, do not restart.**
+
+Merging them (option A) means a five-second Redis blip triggers a restart
+loop instead of a brief removal from rotation — the cure is worse than the
+symptom, and the restart destroys in-process state for no reason.
+
+### What is deliberately NOT checked
+
+OpenAI. Readiness must never depend on a third party we do not control: an
+OpenAI incident would mark every replica unready simultaneously, ejecting a
+fleet that is otherwise perfectly capable of serving cached, guarded, and
+refused turns. A readiness probe that fails on someone else's outage causes
+an outage rather than reporting one. Third-party health belongs in alerting
+and traces, not in a routing decision.
+
+### Decision
+
+`GET /readyz` checks Redis (`PING`) and TimescaleDB (`SELECT 1`), each
+wrapped in a 2-second `asyncio.wait_for`, and returns per-dependency detail:
+
+    200  {"status":"ready","checks":{"redis":"ok","database":"ok"}}
+    503  {"status":"not_ready","checks":{"redis":"error: ConnectionError",
+                                         "database":"ok"}}
+
+Three supporting choices:
+
+1. **Timeout per check.** A dependency that *hangs* is worse than one that
+   is down — without a cap the probe hangs too and the orchestrator waits
+   instead of getting an answer. Sequential checks (worst case 4s) keep
+   failure attribution obvious; readiness is not a latency-sensitive path.
+2. **Exception class names only**, never messages. Driver errors routinely
+   embed the full connection string, password included, and probe output is
+   the least-protected surface in the service.
+3. **Conditional registration.** The endpoint is attached via
+   `app.add_api_route(...)` inside an `if settings.ops.enable_readiness_probe`
+   block, so `OPS_ENABLE_READINESS_PROBE=false` yields a real 404 rather than
+   a route that exists but refuses. (`@app.get` is only sugar over
+   `add_api_route` and cannot be wrapped in a conditional.)
+
+### The driver choice: asyncpg, not psycopg
+
+The first implementation used `psycopg` at module scope, matching
+`vector_store.list_documents()`. It broke the app on import: `psycopg` is
+present in the venv with no working libpq backend (no `psycopg_c`, no
+`psycopg_binary`, no system libpq).
+
+Rewritten to use `asyncpg`, which is already in `requirements.lock.txt` and
+is the driver `timescale_vector`'s async client uses for the `/chat` vector
+search. This is better than a workaround: **a readiness probe should
+exercise the driver the service actually serves with.** Checking the health
+of a connection path no request uses would be a probe that can pass while
+the real path is broken.
+
+### Pros
+
+- A dependency outage removes the service from rotation without restarts.
+- The probe diagnoses itself — the failing dependency is named in the body.
+- No new dependencies; the checked path is the served path.
+- Costs nothing when nothing calls it, and one PING + one `SELECT 1` when
+  something does.
+
+### Cons — accepted knowingly
+
+- Nothing calls `/readyz` in the current setup (local uvicorn, no
+  orchestrator, no load balancer). Its value today is manual diagnosis and
+  deployment-readiness; it earns its keep when this is containerized.
+- Two sequential checks mean a worst case of ~4s under total outage.
+- The probe opens its own Redis client and a fresh DB connection per call
+  rather than reusing the chat path's pool — deliberate isolation, at the
+  cost of one extra connection per probe.
+
+### Learnings
+
+- Liveness and readiness are different questions with opposite remedies;
+  one endpoint cannot answer both.
+- Excluding third parties from readiness is not laziness — including them
+  converts someone else's outage into your own.
+- Probe bodies are an information-disclosure surface: report classes, not
+  messages.
+- Verifying a probe means proving all three states: healthy, correctly
+  unhealthy (with the right dependency named), and switched off. Only the
+  middle one actually exercises the logic.

@@ -165,6 +165,15 @@ celery -A worker worker --loglevel=info --concurrency=2
 | `POST` | `/chat` | Send a message — returns a grounded answer with citations |
 | `POST` | `/query` | Stateless single-shot Q&A (no session memory) |
 
+### Health & readiness
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/health` | Liveness — is the process up? |
+| `GET` | `/readyz` | Readiness — are Redis and TimescaleDB reachable? Returns `503` with per-dependency detail when they are not |
+
+Two separate probes on purpose: liveness answers *"restart me"*, readiness answers *"route around me"* — the split container orchestrators expect, so a brief dependency outage pulls the service out of rotation instead of triggering a restart loop. Readiness deliberately excludes third-party APIs, which would otherwise eject every healthy container at once.
+
 ### Example: ingest a document
 
 ```bash
