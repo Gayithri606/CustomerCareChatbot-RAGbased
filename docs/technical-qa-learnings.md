@@ -406,62 +406,102 @@ knowing which ones your environment can actually support, doing those
 properly, and describing the rest accurately rather than aspirationally.
 
 ---
+---
 
-## L13. A lazy import can hide a broken dependency for months
+## L13. "It works on my machine" was literally true — one codebase, two interpreters
 
-Found while building `/readyz`. Adding `import psycopg` at the top of
-`main.py` crashed the app instantly:
+> **Correction note.** This entry originally claimed `GET /documents` was
+> broken and had been failing silently for months. That was wrong, and it was
+> committed to `main` before being checked. The endpoint returned 200 the
+> whole time. What follows is the corrected account, kept in place of the
+> original because the mistake and its cause are the useful part.
+
+### What happened
+
+While adding `/readyz`, a top-level `import psycopg` in `main.py` crashed the
+app:
 
     ImportError: no pq wrapper available.
     - couldn't import psycopg 'c' implementation: No module named 'psycopg_c'
     - couldn't import psycopg 'binary' implementation: No module named 'psycopg_binary'
     - couldn't import psycopg 'python' implementation: libpq library not found
 
-`psycopg==3.3.4` is installed, but psycopg 3 is only a wrapper — it needs a
-libpq backend from `psycopg[binary]`, `psycopg[c]`, or a system libpq. None
-is present in this venv.
+`vector_store.list_documents()` contains that same import, so the conclusion
+looked obvious: `GET /documents` must be broken too. It wasn't — `curl` to
+the running server returned all five documents, 200.
 
-**The part worth remembering:** this was already broken, and the codebase
-was hiding it. `vector_store.py` imports psycopg **inside**
-`list_documents()` (line ~304), not at module scope:
+### Why both observations were correct
+
+Two different Python interpreters were involved.
+
+| | Interpreter | `import psycopg` |
+|---|---|---|
+| `python -c ...` in the shell | project `.venv` | **fails** |
+| the uvicorn server on :8888 | homebrew Python 3.13 | **works** |
+
+`lsof -ti :8888 | xargs ps` settled it: the running server was
+`/opt/homebrew/Cellar/python@3.13/.../Python -m uvicorn`, not
+`.venv/bin/python`. It had been started six days earlier from a terminal
+where the venv was not active, and homebrew's site-packages happened to have
+a working psycopg backend.
+
+So the endpoint worked *on the interpreter serving requests* and would have
+failed *on the interpreter the project pins*. Same code, opposite results.
+
+### Why psycopg 3 in particular
+
+psycopg 3 ships as a wrapper plus a **separately installed backend**:
+
+- `pip install psycopg` → wrapper only, nothing to wrap.
+- `pip install "psycopg[binary]"` → wrapper + `psycopg_binary` (libpq bundled).
+- `pip install "psycopg[c]"` → wrapper + `psycopg_c` (compiled against system libpq).
+
+`requirements.txt` listed the bare `psycopg`, so the venv got a wrapper with
+no backend. The project's other two drivers cannot fail this way: `asyncpg`
+speaks the Postgres wire protocol directly and never touches libpq, and
+`psycopg2`'s wheel bundles it.
+
+**Resolution:** `pip install "psycopg[binary]"` in the venv;
+`requirements.txt` now pins `psycopg[binary]`; the lock file regenerated.
+No code change was needed.
+
+### The lazy import's actual role
+
+`list_documents()` imports psycopg *inside* the function:
 
 ```python
 async def list_documents(self) -> List[dict]:
     ...
-    import psycopg          # ← executed only when this function is called
+    import psycopg          # runs only when this endpoint is called
 ```
 
-A module-level import runs once, at startup, and fails loudly. A
-function-level import runs only when something calls that function — so
-`GET /documents` has been raising ImportError while the app started
-normally and `/chat` worked perfectly. My top-level import didn't create
-the bug; it moved the failure from "one endpoint, when used" to "the whole
-app, at startup", which is why it surfaced.
+This did not cause the bug, but it is why the environment mismatch could
+persist unnoticed: a module-level import is checked at startup, loudly, on
+whichever interpreter is actually running. A function-level import defers
+that check until someone calls the function — so a venv missing the backend
+would have started cleanly, served `/chat` perfectly, and only failed when
+someone touched one rarely used endpoint.
 
-**Three drivers, one database.** `requirements.lock.txt` currently pins
-`asyncpg==0.31.0`, `psycopg==3.3.4`, and `psycopg2==2.9.12` — three Postgres
-drivers for one database, only two of which work. `timescale_vector` pulls
-in asyncpg (async client) and psycopg2 (sync client); psycopg 3 was added by
-hand for `list_documents()`.
+### The lessons
 
-**Resolution for `/readyz`:** use `asyncpg`. It is already installed, and it
-is the driver the `/chat` vector search actually runs on — so the probe
-tests the connection path the service really serves with, rather than a
-second path that could pass while the real one is broken.
-
-**Still open (not fixed by this unit):** `GET /documents` remains broken.
-Either `pip install "psycopg[binary]"` and refresh the lock file, or rewrite
-`list_documents()` on asyncpg and drop psycopg 3 entirely. The second is the
-Phase 12 cleanup answer — fewer drivers, one connection story.
-
-### General principles
-
-- **Module-level imports are a startup smoke test.** Every import at the top
-  of a file is checked the moment the app boots. Imports hidden inside
-  functions defer that check to whenever someone happens to call the
-  function — which, for a rarely used endpoint, can be never.
-- A lazy import is justified for genuinely optional or slow dependencies,
-  and should say so in a comment. An unexplained one usually means "this was
-  a circular-import workaround" or "nobody thought about it".
-- "It's in the lock file" proves a package is installed, not that it can
-  load. Pinning and importing are different guarantees.
+- **"It works" is not a claim until you name the environment.** Every result
+  in a debugging session belongs to a specific interpreter; a result without
+  one is not evidence. `lsof -ti :PORT | xargs -I{} ps -o pid=,command= -p {}`
+  answers "what is actually serving this port?" in one line, and it should be
+  the first question when two observations disagree.
+- **A lock file only means something if you run what it pins.** The venv was
+  the pinned environment; the server was not running in it. Both facts were
+  invisible until something forced them into the open.
+- **Verify on the interpreter you ship.** A stale server from a previous
+  session is a silent lie — it holds old code, old imports, and possibly an
+  entirely different Python.
+- **Module-level imports are a startup smoke test.** Deferring an import into
+  a function trades a loud failure at boot for a quiet one at call time.
+  Justified for genuinely optional or slow dependencies, and it should say so
+  in a comment; otherwise prefer the top of the file.
+- (Meta) The original version of this entry asserted a bug from one failing
+  command without ever calling the endpoint — and reached `main` that way.
+  The review question that caught it was simply *"everything works when I
+  test it, so why are we changing this?"* One curl settled what a paragraph
+  of plausible reasoning had gotten backwards. Test the claim, then write it
+  down — not the other way around.
