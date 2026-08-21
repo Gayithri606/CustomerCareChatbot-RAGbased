@@ -132,19 +132,34 @@ pip install -r requirements.txt
 
 ```bash
 cd app
-python -m uvicorn main:app --port 8888
+../.venv/bin/python -m uvicorn main:app --port 8888
 ```
 
 Swagger UI: **http://127.0.0.1:8888/docs**
+
+> Start the server with the explicit `../.venv/bin/python` path rather than a
+> bare `python` or `uvicorn`. If the virtualenv isn't active in that shell,
+> a bare command silently runs under the system Python with a different set
+> of installed packages — the environment `requirements.lock.txt` pins is
+> then not the one serving requests. To check what is actually running:
+> `lsof -ti :8888 | xargs -I{} ps -o pid=,command= -p {}`
 
 ### 5 — Start the Celery worker (separate terminal)
 
 ```bash
 cd app
-celery -A worker worker --loglevel=info --concurrency=2
+../.venv/bin/celery -A worker worker --loglevel=info --concurrency=2
 ```
 
 > Use `--concurrency=2` for local dev to keep DB connection count low.
+
+### Recording a demo, or returning after a break
+
+`docs/demo-runbook.md` is the step-by-step version of everything above, plus a
+six-scenario demo script (grounded answer, multi-turn follow-up, out-of-scope
+refusal, jailbreak and PII blocks, human escalation, readiness failure) and the
+traps worth knowing. Written to be followed without prior familiarity with the
+project.
 
 ---
 
@@ -177,7 +192,7 @@ Two separate probes on purpose: liveness answers *"restart me"*, readiness answe
 ### Example: ingest a document
 
 ```bash
-curl -X POST http://127.0.0.1:8888/ingest \
+curl -X POST http://127.0.0.1:8888/ingest/ \
   -F "file=@yourfile.pdf"
 # Returns: { "job_id": "abc-123", "filename": "yourfile.pdf", ... }
 ```
@@ -185,14 +200,27 @@ curl -X POST http://127.0.0.1:8888/ingest \
 ### Example: chat
 
 ```bash
-curl -X POST http://127.0.0.1:8888/chat \
+curl -X POST http://127.0.0.1:8888/chat/ \
   -H "Content-Type: application/json" \
   -d '{
-    "message": "What is your return policy?",
-    "session_id": "user-session-42"
+    "message": "What CFM do I need for a range hood over a gas range?",
+    "session_id": "00000000-0000-0000-0000-000000000001"
   }'
 # Returns: { "answer": "...", "citations": [...], "enough_context": true }
 ```
+
+Three things that will otherwise bite:
+
+- **The trailing slash matters.** `/chat/` and `/documents/` are mounted with
+  one; without it FastAPI answers `307 Temporary Redirect`, and `curl` does
+  not follow redirects by default — so you get an empty response rather than
+  an error. Add the slash, or pass `-L`.
+- **`session_id` must be a UUID**, or the request is rejected with `422`
+  before the pipeline runs. Generate one with `uuidgen`.
+- **Ask about what has been ingested.** Questions outside the knowledge base
+  are refused by the relevance gate with
+  `"refused_reason": "relevance_gate:out_of_scope"` — that is the guardrail
+  working, not a failure. `GET /documents/` lists what is currently indexed.
 
 ---
 
