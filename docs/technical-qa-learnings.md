@@ -505,3 +505,97 @@ someone touched one rarely used endpoint.
   test it, so why are we changing this?"* One curl settled what a paragraph
   of plausible reasoning had gotten backwards. Test the claim, then write it
   down — not the other way around.
+
+---
+
+## L14. The relevance gate sorts by vocabulary, not by subject
+
+Found while building the demo page. Three questions, all about range hoods,
+against a knowledge base that is a 174-chunk range-hood ventilation guide.
+Threshold 0.45 (cosine distance — 0 is identical meaning, larger is further
+apart):
+
+| Question | Distance | Gate |
+|---|---|---|
+| "What CFM do I need for a range hood over a gas range?" | **0.388** | passed |
+| "Can I speak to a person about my range hood not venting properly?" | **0.478** | refused |
+| "My range hood is very noisy — what can I do?" | above 0.45 | refused |
+
+All three are on-topic. The threshold falls *between* them.
+
+### Why
+
+Question 1 is written in the manual's own vocabulary — "CFM", "range hood",
+"gas range" are the exact terms the document uses, so its embedding lands close
+to the chunks.
+
+Questions 2 and 3 are written the way customers actually write: a complaint
+("is very noisy"), a request ("can I speak to a person"), an implied problem
+rather than a stated topic. The document contains none of that language. Same
+subject, further away in embedding space.
+
+So the gate is not separating **on-topic from off-topic**. It is separating
+**text that resembles the documentation from text that doesn't** — and then
+treating the second group as out of scope.
+
+### Why this matters more here than in a general RAG system
+
+A document Q&A tool is mostly used by people who already know the domain and
+query in its vocabulary — the failure mode barely shows. A customer-care bot is
+the opposite: its entire input distribution is customers describing symptoms in
+their own words. **The questions this gate rejects are precisely the ones the
+product exists to answer.**
+
+The uncomfortable framing: a gate tuned on documentation-style questions will
+look excellent in testing and fail in production, because the test set and the
+real traffic are written by different kinds of people.
+
+### What is not yet known
+
+Where genuinely off-topic questions land. Two possibilities, with different
+conclusions:
+
+- Off-topic clusters high (say 0.8+) → the two groups separate cleanly, the
+  line is simply in the wrong place, and raising it is a complete fix.
+- Off-topic sits near 0.5 → the groups **overlap**, and no single distance
+  threshold can separate customer-phrased on-topic questions from off-topic
+  ones. Threshold tuning would then be choosing which error to make, not
+  eliminating error.
+
+The second outcome is the more interesting one, and it cannot be ruled out by
+reasoning — only by measuring.
+
+### How to measure it (the gate as its own instrument)
+
+`best_distance` is only logged when the gate *refuses*, so passing questions
+reveal nothing. Setting `RETRIEVAL_DISTANCE_THRESHOLD=0.01` makes the gate
+refuse everything, which turns it into a measuring device: every message logs
+its distance, at the cost of one embedding each and no LLM calls at all.
+
+Send a mixed set — on-topic in customer phrasing, on-topic in documentation
+phrasing, and clearly off-topic — and read the distances off
+`chat_refused_relevance ... best_distance=`. The threshold belongs where the
+evidence puts it, and the measurements belong in the ADR.
+
+### A related case no threshold can fix
+
+*"Can I speak to a person?"* is not a knowledge-base question at all — it is a
+routing request. No document answers it, so its distance will always be large,
+and it will always be refused no matter where the line is drawn. Asking for a
+human is never out of scope; it needs a check that runs independently of the
+gate rather than a better threshold.
+
+(Fix designed, not yet applied at the time of writing: check the escalation
+keywords inside the gate-refusal branch and escalate on the way out.)
+
+### The general lesson
+
+A retrieval threshold is a proxy. It measures *"does this text resemble my
+documents?"* and gets used as if it answered *"is this question about my
+domain?"* Those two questions agree for users who speak like the documents and
+diverge for everyone else — and the divergence is invisible until you measure
+it against language real users produce.
+
+Corollary for evaluation sets: write the probe questions the way customers
+write, not the way the manual does. A test set drawn from the documentation
+measures the wrong thing and passes.
