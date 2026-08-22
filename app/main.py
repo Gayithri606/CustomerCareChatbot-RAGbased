@@ -1,10 +1,12 @@
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import asyncpg
 import redis.asyncio as aioredis
 from fastapi import FastAPI, Response
+from fastapi.responses import HTMLResponse
 
 from config.settings import get_settings
 from api.routes import ingest, query, documents ,jobs, chat
@@ -23,23 +25,52 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Document RAG API",
-    description="RAG-based document processing and Q&A pipeline",
+    title="Customer Care Chatbot — RAG API",
+    description=(
+        "A retrieval-augmented customer-care chatbot: layered guardrails, "
+        "session memory, and grounded answers with citations. Also exposes "
+        "the document ingestion and retrieval pipeline it is built on."
+    ),
     version="0.1.0",
     lifespan=lifespan,
 )
 
-app.include_router(ingest.router)
-app.include_router(query.router)
+# Router order determines the section order on /docs. Chat first: it is what
+# this project is about, and it is what a reader should see without scrolling.
+app.include_router(chat.router)
 app.include_router(documents.router)
+app.include_router(ingest.router)
 app.include_router(jobs.router)
-app.include_router(chat.router) 
+app.include_router(query.router) 
 
 
 @app.get("/health", tags=["health"])
 def health_check():
     """Quick liveness check — returns 200 if the server is up."""
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Demo page
+# ---------------------------------------------------------------------------
+# A single static HTML page for showing the chatbot to non-technical viewers:
+# conversation bubbles, citations, and visible guardrail refusals.
+#
+# Served by this app on purpose. The page and POST /chat/ then share an
+# origin, so no CORS middleware is needed — opening the file directly from
+# disk would require one.
+#
+# Read at request time rather than at import time so edits to the page show
+# up on refresh without restarting the server. include_in_schema=False keeps
+# it out of /docs: it is a demo client, not part of the API contract.
+
+_DEMO_PAGE = Path(__file__).parent / "static" / "demo.html"
+
+
+@app.get("/demo", response_class=HTMLResponse, include_in_schema=False)
+def demo_page() -> HTMLResponse:
+    """Serve the demo chat page."""
+    return HTMLResponse(_DEMO_PAGE.read_text(encoding="utf-8"))
 
 
 # ---------------------------------------------------------------------------
@@ -75,8 +106,8 @@ async def _check_database() -> None:
     Uses asyncpg rather than psycopg deliberately: asyncpg is the driver
     `timescale_vector`'s async client already uses for the vector search in
     POST /chat, so this probe exercises the same connection path we
-    actually serve with. (psycopg is installed but has no working libpq
-    backend in this venv — see the note on GET /documents.)
+    actually serve with — a probe should test what the service really runs
+    on, not a second path that could pass while the real one is broken.
     """
 
     async def _select_one() -> None:
