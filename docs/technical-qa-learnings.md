@@ -523,6 +523,70 @@ apart):
 
 All three are on-topic. The threshold falls *between* them.
 
+### How this surfaced
+
+Not from testing the gate. It came out of building the `/demo` page for
+portfolio screenshots — and the reason is worth keeping.
+
+Every question used in development up to that point had been written by me,
+about the system, in the document's own terms. The demo needed questions a
+*customer* would ask, because the audience was non-technical. Writing that
+example set was, accidentally, the first evaluation the gate had ever faced
+with realistic input.
+
+The sequence:
+
+1. A demo scenario was meant to show human escalation, using *"My range hood is
+   not venting properly — can I speak to a person about this?"*. It came back
+   as `relevance_gate:out_of_scope`. The predicted cause was stage ordering —
+   the escalation keyword check runs at stage 7, after the gate at stage 5.
+2. That explanation was correct but incomplete. The message was *also* clearly
+   about a range hood, and the knowledge base is a range-hood guide, so the
+   gate should not have refused it on relevance grounds either.
+3. Rather than reword the demo question, we read the log:
+   `chat_refused_relevance ... best_distance=0.4782 reason=best_distance 0.4782
+   > threshold 0.45`. Refused by 0.028.
+4. One data point is a coincidence. Probing further, *"My range hood is very
+   noisy — what can I do?"* was also refused, while *"What size duct do I need
+   for a range hood?"* was answered well.
+5. The demo page's engineering-detail toggle showed the passing CFM question at
+   **distance 0.388**. Laying the passes and refusals side by side, the split
+   was not by subject — every one of them was about range hoods — but by
+   whether the sentence used the manual's words.
+
+The near-miss worth recording: the obvious move at step 3 was to reword the
+demo question until it passed and carry on taking screenshots. That would have
+produced a working demo and left a real defect in place, undetected, with the
+evidence sitting unread in the log. Reading the number instead of adjusting the
+input is what turned a broken screenshot into a finding.
+
+### The full probe set
+
+Everything actually sent, and what happened. Threshold 0.45; the knowledge base
+is a 174-chunk Viking range-hood ventilation guide.
+
+| Question | Outcome |
+|---|---|
+| "What CFM do I need for a range hood over a gas range?" | answered, 2 citations, distance **0.388** |
+| "What size duct do I need for a range hood?" | answered well (7-inch for 300–600 CFM, 10-inch for 900–1500) |
+| "And what size duct do I need for that?" (follow-up) | condensed to *"What size duct do I need for the range hood over a gas range?"*, answered, 2721 retrieved tokens |
+| "And what about ductwork for that?" (follow-up) | condensed to *"What **type** of ductwork do I need…"*, passed the gate, retrieved 5 chunks totalling only **433 tokens**, agent set `enough_context=False` |
+| "How high should a range hood be mounted above the range?" | passed the gate, `enough_context=False` — topic likely not covered |
+| "My range hood is not venting properly — can I speak to a person about this?" | **refused by the gate**, distance **0.4782** |
+| "My range hood is very noisy — what can I do?" | **refused by the gate** |
+| "What is the weather in San Jose today?" | refused by the gate (correctly — genuinely off-topic) |
+
+Reading down the table, the pattern is legible: the three that answered are
+noun-phrase questions built from the manual's vocabulary. The two false
+refusals are complaint-shaped sentences — *"is not venting properly"*, *"is
+very noisy — what can I do?"* — containing no term the document uses.
+
+The two `enough_context=False` rows are a **different** failure and should not
+be confused with it: those passed the gate and failed at retrieval quality.
+Note especially the ductwork pair — *"what type of ductwork"* returned 433
+tokens of thin fragments while *"what size duct"* returned 2721 tokens of
+usable text. Phrasing moved the outcome there too, one layer down.
+
 ### Why
 
 Question 1 is written in the manual's own vocabulary — "CFM", "range hood",
