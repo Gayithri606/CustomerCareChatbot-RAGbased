@@ -431,3 +431,178 @@ the real path is broken.
 - Verifying a probe means proving all three states: healthy, correctly
   unhealthy (with the right dependency named), and switched off. Only the
   middle one actually exercises the logic.
+
+---
+
+## ADR-008 — Asking for a human is never out of scope: escalate from inside the relevance-gate refusal
+
+**Date:** 2026-08-24 · **Status:** Accepted, implemented · **Files:** `app/api/routes/chat.py`, `app/static/demo.html` · **Companion to:** learnings L14, L15
+
+> ADR-007 is deliberately reserved for the relevance-gate boundary decision,
+> which is blocked on measurement. This entry was written first; the IDs are
+> stable labels, not a timeline.
+
+### The problem
+
+A customer who types *"I need a human agent."* is refused by the relevance
+gate at stage 5 and never reaches the deterministic keyword escalation at
+stage 7. The bot replies *"I can only help with topics covered in my
+knowledge base"* and sets `needs_human=False` — the single most important
+message a customer-care bot can receive, dropped on the floor.
+
+This is **not** the threshold problem of L14, and raising the threshold
+cannot fix it. Asking for a human is a **routing request**, not a
+knowledge-base question. No document answers it, so its embedding is far
+from every chunk by construction. Any threshold loose enough to admit it
+would admit everything.
+
+### Options considered
+
+| Option | Idea | Verdict |
+|---|---|---|
+| A | Raise the relevance threshold until handoff requests pass | Rejected — the distance is large *correctly*; no line can separate a routing request from genuine noise |
+| B | Move the keyword check before the gate and short-circuit | Rejected — see below |
+| **C** | **Check the escalation keywords inside the gate's refusal branch** | **Chosen** |
+| D | Leave the code; reword the demo scenario to stay on-topic | Rejected — this is exactly the near-miss L14 records: adjusting the input until the defect stops showing |
+
+Option B is the intuitive one and it is wrong in a way worth recording. A
+handoff check that runs *before* the gate and returns immediately would break
+Decision E3's additive escalation: a customer asking *"What CFM do I need for
+a gas range? Can I speak to a person?"* would be routed to a human **instead
+of** getting the grounded answer they also asked for. The existing stage 7
+already handles that case correctly. Only the refusal path is broken, so only
+the refusal path should change.
+
+### Decision
+
+In the stage 5 refusal branch, call the existing `_mentions_human_handoff()`
+on the **raw** message (not the condensed rewrite — the condenser
+demonstrably moves the handoff clause to the front of the sentence, and stage
+7 already uses the raw message, so both escalation paths now read the same
+input). When true, return `_HANDOFF_MESSAGE` with `needs_human=True` and
+`refused_reason="relevance_gate:out_of_scope+handoff"`.
+
+Both paths now work: on-topic + handoff passes the gate and stage 7 sets the
+flag; off-topic + handoff refuses **and** escalates.
+
+### The debate — two review objections that changed the patch
+
+The first draft was accepted in shape and rejected in both of its strings.
+
+**Objection 1 — the message answered a question nobody asked.** The proposed
+text was *"I can't answer that from my knowledge base, but I can put you
+through to a human agent."* For a bare *"I need a human agent."* the first
+clause apologises for a question the customer never asked — a bot sounding
+inattentive at precisely the moment the customer has already given up on it.
+
+Two situations reach this branch: a **pure** routing request, and an
+out-of-scope question that *also* requests routing. Telling them apart means
+answering "does this message also contain a knowledge question?" — the same
+problem the gate is already failing at (L14) — so any detector would be a
+regex that is wrong some of the time, and L10 established that a message
+wrong in one of its branches is worse than one branch that is always right.
+
+Resolution: **narrow the claim until it is true in both cases.** The
+knowledge-base clause was deleted rather than made conditional.
+
+**Objection 2 — `refused_reason` was true about the mechanism and misleading
+about the meaning.** Leaving `relevance_gate:out_of_scope` on an escalated
+turn correctly reports that the gate ended the turn before any LLM call, and
+incorrectly implies the customer asked something out of scope. Asking for a
+human is never out of scope.
+
+The defence initially offered — "`needs_human` carries the other fact, so no
+information is lost" — was true about information and false about honesty,
+and its real motive was that `demo.html` renders its guardrail banner off
+this field. A field value chosen to protect a screenshot is not a decision.
+
+Four values were weighed (full table in L15). `null` was rejected for
+breaking the field's documented contract — no LLM ran, so the turn *was*
+guarded. `escalation:human_requested` was the runner-up and has a real
+argument: it is the only option that stops filing a successful escalation
+under a `refused_*` label, which matters if these values ever reach a
+dashboard. It was not chosen because it discards the fact that the
+*relevance gate* is what stopped the turn — precisely the signal ADR-007
+exists to study.
+
+Chosen: `relevance_gate:out_of_scope+handoff`. Both facts, one field,
+greppable, and `demo.html`'s prefix matching still fires.
+
+### The rendering change is part of the decision, not scope creep
+
+`guardLabel()` in `demo.html` labels any `relevance_gate*` reason *"outside
+the knowledge base, refused before any language-model call."* Shipping the
+new value without a matching branch would put the exact sentence just deleted
+from the customer-facing message back on the screen, one line higher. A
+status value and its rendering are one change.
+
+The new branch is inserted **above** the generic one — `indexOf(...) === 0`
+is first-match-wins, and `"relevance_gate"` would otherwise swallow the more
+specific value.
+
+### Verification — what was actually observed
+
+Three cases on `/demo`, one session, engineering detail on:
+
+| Message | Banner | Badge | `refused_reason` |
+|---|---|---|---|
+| *"I need a human agent."* | new escalation wording | yes | `relevance_gate:out_of_scope+handoff` |
+| *"What is the weather in San Jose today?"* | original out-of-scope wording | **no** | `relevance_gate:out_of_scope` |
+| *"What CFM do I need for a range hood over a gas range? Can I speak to a person?"* | none | yes | `null` |
+
+Case 1 is the fix. Case 2 proves the branch is conditional rather than
+universal. Case 3 proves escalation stayed additive — the customer still
+receives the grounded answer with its citation, which is the property option
+B would have destroyed.
+
+Case 3 carries one limit worth stating: the badge alone does not distinguish
+the model setting `needs_human` itself from stage 7's keyword override
+forcing it. Only the presence of `chat_escalation_forced_by_keyword` in the
+server log settles which fired, and the response body cannot show it.
+
+### Pros
+
+- The one message a customer-care bot must never ignore is now handled on
+  every path through the route.
+- Costs nothing: a set intersection over an already-lowercased message, on a
+  branch that had already decided to refuse. No embedding, no model call.
+- Reuses the existing `_mentions_human_handoff` helper — one definition of
+  "asked for a human", called from both stage 5 and stage 7.
+- The response is self-describing: `refused_reason` names both the mechanism
+  and the outcome, so a log reader a year from now needs no context.
+
+### Cons — accepted knowingly
+
+- **Keyword matching stays a wordlist.** *"I need a person to look at this"*
+  fires; *"get me someone who knows what they're doing"* does not. False
+  negatives remain, and the honest framing is that this catches the common
+  phrasings cheaply, not all of them.
+- The wordlist is still a module-level constant in `chat.py` rather than a
+  `GuardrailPolicy` field. It is now read from two places in that file, which
+  strengthens the case for promoting it beside the profanity list — still
+  queued, still not done.
+- **`_HANDOFF_MESSAGE` promises routing this service does not perform.** It
+  sets a flag for a surrounding system that does not exist in this project.
+  That remains the correct contract — signalling is the API's job — but the
+  text is written for the deployment, not for the demo, and a reader deserves
+  to know that (L15).
+- Input-guard refusals (PII, jailbreak) still do not escalate. *"My SSN is
+  …, get me a human"* refuses without routing. That is a separate judgment
+  call and deliberately not bundled here.
+
+### Learnings
+
+- A similarity threshold can only answer questions that documents answer.
+  Messages *about* the conversation — asking for a human, complaining,
+  withdrawing consent — are a different kind of input and need a check that
+  does not run through the embedding at all.
+- When one string has to describe two situations, branch it if the situations
+  are reliably distinguishable and narrow it if they are not. Writing for the
+  case you had in mind and letting it apply to the case you didn't is the
+  failure mode, and it is invisible in testing because the misdescribed case
+  is the one nobody tried.
+- If the reason a value keeps its current form is that changing it would make
+  a screenshot look worse, that is not a reason — it is the screenshot asking
+  to be re-taken.
+- A status code and the UI that renders it are one decision. Shipping the
+  first without the second relocates the bug rather than fixing it.

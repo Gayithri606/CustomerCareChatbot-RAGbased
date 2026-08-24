@@ -663,3 +663,140 @@ it against language real users produce.
 Corollary for evaluation sets: write the probe questions the way customers
 write, not the way the manual does. A test set drawn from the documentation
 measures the wrong thing and passes.
+
+---
+
+## L15. A canned message and a status code both tried to describe two situations at once
+
+Asked while reviewing the escalation fix, before it was applied: *the handoff
+message says "I can't answer that from my knowledge base, but I can put you
+through to a human agent" — but when the customer only asked for a human and
+nothing was out of scope, that answer doesn't look good. And `refused_reason`
+staying `relevance_gate:out_of_scope` may not be 100% relevant either.*
+
+Both objections were correct, and they are the same mistake made twice in one
+patch: a single fixed string describing a situation that is actually two
+situations.
+
+### The fix under review
+
+A customer asking for a human is refused by the relevance gate at stage 5 and
+never reaches the deterministic keyword escalation at stage 7. No document
+answers "can I speak to a person?", so its embedding is always far from the
+knowledge base and no threshold can rescue it. The fix checks the escalation
+keywords inside the gate's refusal branch and escalates on the way out.
+
+The shape of that fix is right. Both strings attached to it were wrong.
+
+### Problem 1 — the message answered a question nobody asked
+
+Two situations reach that branch:
+
+| | Message | What is actually true |
+|---|---|---|
+| **A** | *"I need a human agent."* | Pure routing request. Nothing was out of scope. |
+| **B** | *"What's the weather? Can I speak to someone?"* | An out-of-scope question **and** a routing request. |
+
+The proposed text was written for B:
+
+> "I can't answer that from my knowledge base, but I can put you through to a
+> human agent — I'm passing this conversation on now."
+
+Applied to A, the first clause apologises for a question the customer never
+asked. It reads like a bot that did not listen — which, for the one message
+type where the customer has already lost patience with the bot, is the worst
+possible moment to sound inattentive.
+
+**Why not branch and write two messages?** Because telling A from B means
+answering "does this message also contain a knowledge question?" — the same
+problem the relevance gate is already failing at (L14). Any regex for it would
+be wrong some of the time, and L10 established that a message which is wrong in
+one of its branches is worse than one branch that is always right.
+
+**Resolution: say only what is true in both cases.** Drop the knowledge-base
+clause entirely rather than trying to make it conditional.
+
+    "Of course — I'm passing this conversation to a human agent now.
+     Someone from the team will pick it up from here."
+
+Correct for A. Correct for B, where the unanswered question simply passes to
+the human along with everything else.
+
+The constant is named `_HANDOFF_MESSAGE`, not `_HANDOFF_ON_REFUSAL_MESSAGE`:
+naming it after the branch it happens to live in would have re-encoded the same
+assumption the wording just shed.
+
+### Problem 2 — `refused_reason` was true about the mechanism, misleading about the meaning
+
+Leaving `refused_reason="relevance_gate:out_of_scope"` on an escalated turn is:
+
+- **true about the mechanism** — the gate really did find no close chunk, and
+  really did end the turn before any LLM call ran, and
+- **misleading about the meaning** — it reports that the customer asked
+  something out of scope, when asking for a human is never out of scope.
+
+One string, two facts. The first defence offered was "`needs_human` carries the
+other fact, so nothing is lost" — which is true about information and false
+about honesty. It also protected a demo screenshot (`demo.html` renders its
+amber guardrail banner off this field), and that was the actual motive. A field
+value chosen to keep a screenshot looking right is a bad reason wearing a good
+argument's clothes.
+
+Second-order cost, and the more durable one: escalations counted under a
+`refused_*` label inflate the refusal rate. For a customer-care bot, "customer
+asked for a human and got routed to one" is a **successful** outcome. A metric
+that files it as a failure will read exactly backwards a year from now.
+
+Options, with what each costs:
+
+| | Value when escalating | Honest? | `/demo` rendering |
+|---|---|---|---|
+| 1 | `relevance_gate:out_of_scope` (unchanged) | mechanism true, meaning misleading | amber + purple |
+| 2 | `relevance_gate:out_of_scope+handoff` | keeps both facts, greppable | amber + purple (prefix match still fires) |
+| 3 | `escalation:human_requested` | names the outcome; drops "the gate stopped it" | falls through to the generic "Guardrail — …" label |
+| 4 | `null` | claims the turn was not guarded — but no LLM ran | purple badge only |
+
+1 and 4 are ruled out: 1 is the objection itself, and 4 breaks the field's
+stated contract in `chat.py`'s docstring — `refused_reason` exists so callers
+can tell an LLM-answered turn from a guarded one, and this turn was guarded.
+
+Between 2 and 3 the trade is real: 2 keeps the fact that the *relevance gate*
+is what stopped the turn, which is precisely what the gate investigation is
+about measuring; 3 is the only option that stops calling an escalation a
+refusal at all. **Open at the time of writing** — recorded here as reasoning,
+not as a decision, to be closed in the ADR once picked.
+
+### A promise the system cannot keep
+
+Worth stating plainly rather than leaving implied: "I'm passing this
+conversation to a human agent now" describes something this service does not
+do. It sets `needs_human=True` — a flag for a surrounding routing system that
+does not exist in this project.
+
+That is still the correct contract. The API's job is to *signal* that a human
+is needed; routing is the caller's job, and building a fake queue to make the
+sentence literally true would be a demo shortcut. But the gap belongs in the
+documentation rather than in a reader's assumptions.
+
+### The general principle
+
+A canned string and a status enum are both *claims about what happened*. When
+one value has to cover two situations, it will be accurate in one and quietly
+wrong in the other — and the wrong one is invisible in testing, because the
+situation it misdescribes is usually the one nobody thought to try.
+
+Two ways out, and the choice between them is not stylistic:
+
+- **When the situations are reliably distinguishable**, branch and give each
+  its own accurate message (ADR-005 did this: the validator can see
+  `retrieved_chunk_ids`, so each failure mode gets the instruction that can
+  actually succeed).
+- **When they are not**, narrow the claim until it is true in every case that
+  reaches it. A shorter true statement beats a richer one that guesses.
+
+The failure to avoid is the third path: writing for the case you had in mind
+and letting it apply to the case you didn't.
+
+Corollary, from how this one was nearly kept: if the reason a field keeps its
+current value is that changing it would make a screenshot look worse, that is
+not a reason. It is the screenshot asking to be re-taken.
