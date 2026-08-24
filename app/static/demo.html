@@ -230,6 +230,8 @@
       return "Input guard — message exceeds the length limit";
     if (reason.indexOf("input_guard") === 0)
       return "Input guard — request refused";
+    if (reason.indexOf("relevance_gate:out_of_scope+handoff") === 0)
+      return "Relevance gate — no matching document, but the request for a human was recognised and escalated";
     if (reason.indexOf("relevance_gate") === 0)
       return "Relevance gate — outside the knowledge base, refused before any language-model call";
     if (reason.indexOf("conversation_guard") === 0)

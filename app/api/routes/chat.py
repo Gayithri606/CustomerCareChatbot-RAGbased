@@ -140,6 +140,11 @@ _SAFE_FALLBACK_MESSAGE: str = (
     "Please try rephrasing, or ask to speak with a human agent."
 )
 
+_HANDOFF_MESSAGE: str = (
+    "Of course — I'm passing this conversation to a human agent now. "
+    "Someone from the team will pick it up from here."
+)
+
 
 def _mentions_human_handoff(message: str) -> bool:
     """True when the user explicitly asks for a human (Q-D trigger 1).
@@ -236,22 +241,45 @@ async def chat(request: ChatRequest) -> ChatResponse:
     # --- Stage 5: relevance gate (Decision E2, ADR-001) --------------------
     gate = await relevance_gate(condensed_query, vector_store, policy)
     if not gate.allowed and policy.refuse_when_no_context:
+        # Asking for a human is a routing request, not a knowledge-base
+        # question. No document answers it, so its distance is always
+        # large and no threshold can rescue it — the check has to run
+        # independently of the gate. Same keywords stage 7 uses, applied
+        # to the RAW message: the condenser can move the handoff clause
+        # to the front of the sentence. See ADR-008, learnings L15.
+        wants_human = _mentions_human_handoff(message)
+
+        # Both facts, one field: the gate is what stopped the turn, and
+        # the customer asked for a human. Reporting only the first would
+        # file a successful escalation as an out-of-scope refusal (L15).
+        refused_reason = (
+            "relevance_gate:out_of_scope+handoff"
+            if wants_human
+            else "relevance_gate:out_of_scope"
+        )
+
         logger.info(
-            "chat_refused_relevance session_id=%s best_distance=%s reason=%s",
+            "chat_refused_relevance session_id=%s best_distance=%s "
+            "reason=%s needs_human=%s",
             session_id,
             gate.best_distance,
             gate.reason,
+            wants_human,
         )
         return ChatResponse(
             session_id=session_id,
             answer=(
-                gate.out_of_scope_message
-                or policy.relevance_out_of_scope_message
+                _HANDOFF_MESSAGE
+                if wants_human
+                else (
+                    gate.out_of_scope_message
+                    or policy.relevance_out_of_scope_message
+                )
             ),
             citations=[],
             enough_context=False,
-            needs_human=False,
-            refused_reason="relevance_gate:out_of_scope",
+            needs_human=wants_human,
+            refused_reason=refused_reason,
         )
 
     if not gate.allowed:
