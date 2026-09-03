@@ -1,4 +1,5 @@
 # CustomerCareChatbot — RAG-based Conversational AI
+**Status:** In active development · Portfolio project
 
 A production-grade **customer care chatbot** built on top of a RAG (Retrieval-Augmented Generation) document ingestion pipeline. The chatbot holds multi-turn conversations, grounds every answer in ingested documents, applies guardrails at every phase of the pipeline, and is designed to mimic a real production architecture using local, open-source components.
 
