@@ -184,16 +184,24 @@ by the model — the model only ever sees chunk IDs (ADR-002).
 curl -s -X POST http://127.0.0.1:8888/chat/ \
   -H 'Content-Type: application/json' \
   -d "{\"session_id\":\"$SID\",
-       \"message\":\"And what about ductwork for that?\"}" | python3 -m json.tool
+       \"message\":\"And what size duct do I need for that?\"}" | python3 -m json.tool
 ```
 
-**Expect:** a relevant ductwork answer, `"enough_context": true`, citations.
+**Expect:** a duct-size answer (e.g. "10-inch duct"), `"enough_context": true`,
+citations.
 
 **Point out:** this is the failure ADR-001 was written for. The relevance gate
 embeds one message at a time, and "that" embeds as noise — so a cheap model
 (`gpt-4o-mini`) rewrites the follow-up into a standalone question *just for the
 gate*. The answering agent still receives the raw message plus full history.
 Watch the server terminal: a `condensed_query` log line shows the rewrite.
+
+> **Use this exact phrasing.** A different-sounding follow-up — "And what
+> about ductwork for that?" — condenses fine but retrieves only 433 tokens of
+> thin chunks and honestly comes back `"enough_context": false` (learnings
+> L14). That is a separate, still-open retrieval-quality gap, not a bug in
+> this scenario, but it means this scenario is not phrasing-proof: don't swap
+> in a different follow-up mid-recording without checking it first.
 
 ---
 
@@ -252,7 +260,8 @@ than refusing a turn. Helpers fail open; safety checks fail closed
 
 ### Scenario 5 — It knows when to hand off to a human
 
-**Say:** "Asking for a person escalates, without abandoning the answer."
+**Say:** "Asking for a person always gets routed to one — even on a message
+the bot can't otherwise answer."
 
 ```bash
 curl -s -X POST http://127.0.0.1:8888/chat/ \
@@ -261,18 +270,37 @@ curl -s -X POST http://127.0.0.1:8888/chat/ \
        \"message\":\"My range hood is not venting properly — can I speak to a person about this?\"}" | python3 -m json.tool
 ```
 
-**Expect:** a real answer about venting **and** `"needs_human": true`.
+**Expect:** `"needs_human": true`, `"refused_reason":
+"relevance_gate:out_of_scope+handoff"`, and the handoff message ("Of course —
+I'm passing this conversation to a human agent now…") — **not** a venting
+answer. This exact sentence sits at distance 0.478 against the knowledge base
+(learnings L14), above the 0.45 relevance threshold, so the gate still
+refuses it on knowledge-base grounds. What ADR-008 changed is that the
+refusal no longer drops the request for a human on the floor: the same
+branch that refuses now also escalates.
 
-**Point out:** escalation is *additive* — the customer still gets the grounded
-answer, and the flag tells the surrounding system to route them onward
-(chat.py Decision E3).
+**Point out:** before ADR-008, this exact message came back as a plain
+out-of-scope refusal with `needs_human: false` — the customer's request for a
+person was silently ignored. The gate's refusal branch now checks for a
+handoff request before responding (chat.py Decision E3, ADR-008), because
+asking for a human is never out of scope, no matter what the distance score
+says.
 
-> ⚠️ **Rehearse this one.** The keyword check runs at stage 7, *after* the
-> relevance gate at stage 5. The message must be on-topic enough to pass the
-> gate, or it gets refused as out-of-scope and never reaches the escalation
-> logic. The phrasing above keeps it about range hoods on purpose. If it comes
-> back as `relevance_gate:out_of_scope`, make the ventilation part of the
-> question stronger and update this file.
+**Second call — escalation stays additive when the question *does* pass the
+gate:**
+
+```bash
+curl -s -X POST http://127.0.0.1:8888/chat/ \
+  -H 'Content-Type: application/json' \
+  -d "{\"session_id\":\"$SID\",
+       \"message\":\"What CFM do I need for a range hood over a gas range? Can I speak to a person?\"}" | python3 -m json.tool
+```
+
+**Expect:** a real CFM answer with a citation, **and** `"needs_human": true`,
+`"refused_reason": null`. This one never reaches the gate's refusal branch —
+it's caught by the deterministic keyword check at stage 7, which has worked
+since Decision E3 and is unchanged by ADR-008. Point this one out as the
+proof that escalation doesn't replace the answer; it rides alongside it.
 
 ---
 
