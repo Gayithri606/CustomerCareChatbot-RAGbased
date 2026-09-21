@@ -227,15 +227,17 @@ async def chat(request: ChatRequest) -> ChatResponse:
         )
 
     
-    # --- Stage 4.5: condense follow-ups into standalone queries (ADR-001) --
-    # The gate embeds a single message; pronoun follow-ups ("what about
-    # ductwork for that?") embed as noise and get wrongly refused. The
-    # condenser rewrites them using history (see ADR-004 for why it takes
-    # a rendered transcript, not message_history). First turns skip the
-    # call. The AGENT still receives the raw message + full history — the
-    # condensed form exists only for the gate's embedding.
+    # --- Stage 4.5: condense every message into a standalone, doc-style
+    # query for the gate (ADR-001, extended). Handles two things: pronoun
+    # follow-ups ("what about ductwork for that?") that embed as noise
+    # using history (see ADR-004 for why it takes a rendered transcript,
+    # not message_history), AND vocabulary-gap first messages ("the vent
+    # pipe is rattling") that never share wording with the docs. Runs on
+    # every turn now, not just follow-ups. The AGENT still receives the
+    # raw message + full history — the condensed form exists only for the
+    # gate's embedding.
     condensed_query = message
-    if policy.relevance_gate_enabled and history:
+    if policy.relevance_gate_enabled:
         condensed_query = await condense_query(message, history)
 
     # --- Stage 5: relevance gate (Decision E2, ADR-001) --------------------

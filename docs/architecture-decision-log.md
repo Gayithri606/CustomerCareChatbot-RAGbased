@@ -434,13 +434,194 @@ the real path is broken.
 
 ---
 
+## ADR-007 — Run query condensation on every turn to close the customer/documentation vocabulary gap
+
+**Date:** 2026-09-21 · **Status:** Accepted, implemented · **Files:** `app/chatbot/condenser.py`, `app/api/routes/chat.py` · **Companion to:** learnings L14, L16, L17, L18
+
+### The problem
+
+The relevance gate refuses on-topic questions written the way customers
+write, while accepting the same topic written the way the documentation
+writes. A customer asking *"What size pipe do I need to run from my hood
+to the outside?"* was refused at 0.4852; the same question as
+*"What size duct do I need for a range hood?"* passed at 0.3567.
+
+This is the classic lexical gap, and embeddings inherit it: they encode
+statistical co-occurrence, not meaning, so two phrasings of one question
+land apart when their registers differ.
+
+**Measured, not assumed.** The gate only logs `best_distance` on its
+refuse path, so distances for passing messages were invisible. Forcing
+`RETRIEVAL_DISTANCE_THRESHOLD=0.01` makes every message refuse, which
+makes every distance observable. Three probe rounds ran that way; round 3
+used a matched-pairs design — same topic, phrasing as the sole variable —
+which removes topic as a confound. Result: phrasing alone moved distance
+by 0.09–0.15 and flipped the verdict in 4 of 6 pairs.
+
+Two earlier findings ruled out the obvious fix. A genuinely off-topic
+question scored *closer* than a genuinely on-topic one (weather 0.6066
+vs. rattling fan 0.6647), so no single threshold separates the groups.
+And a wrong-device question already passes today (attic fan CFM, 0.4371),
+so the gate has a precision problem as well as a recall problem.
+
+### Options considered
+
+| Option | Idea | Verdict |
+|---|---|---|
+| A — Raise the threshold | Move 0.45 up until customer phrasings pass | Rejected: measured overlap means any threshold that admits the customer phrasings also admits off-topic traffic |
+| B — Uncertainty band + LLM judge | Second model adjudicates borderline distances | Rejected: new component, and a model call on every borderline turn |
+| C — Hybrid search (vector + BM25) | Add keyword matching alongside embeddings | Rejected *here* — see the debate |
+| D — Reranking (cross-encoder) | Retrieve N candidates, score each against the query | Rejected: requires restructuring the gate, plus infrastructure not in this stack |
+| E — HyDE | Generate a hypothetical answer, embed that | Rejected: invents content against a small precise corpus |
+| **F — Condensation on every turn** | **Extend the existing condenser to rewrite first messages too, normalizing register** | **Chosen** |
+
+### The debate
+
+Ranking the candidates by *industry frequency* and by *fit for this
+specific failure* produced almost opposite orders — hybrid search and
+reranking dominate the first, query rewriting the second. That
+divergence was the useful part of the analysis, and resolving it decided
+the entry.
+
+**Why hybrid search loses here despite being the most common answer.**
+Its strength is exact term matching. This failure has near-zero shared
+vocabulary between question and document — "pipe" against "duct" — so
+the mechanism hybrid search adds is precisely the one that cannot fire.
+It is the right tool for a different problem (rare tokens, model numbers,
+part codes) and should be reconsidered when that problem appears.
+
+**Why reranking loses on architecture, not on quality.** Reranking needs
+a candidate set to score. The gate is deliberately one embedding plus one
+top-1 lookup (Decision E2) — there is nothing to rerank without first
+widening it. So adopting reranking means changing the shape of the gate
+*and* adding a component the stack does not have. Condensation, by
+contrast, already exists, is already proven (ADR-001), and already sits
+at stage 4.5 immediately before the gate. It changes what text gets
+embedded and leaves the gate's shape untouched. Both use a small model,
+so "uses an LLM" was never the deciding cost — reuse versus new
+infrastructure was (L16).
+
+**Why HyDE loses.** It fabricates a hypothetical answer and embeds that.
+Against a small, precise technical corpus, inventing plausible technical
+content is a hallucination surface with no upside that rewriting lacks.
+Rewriting only rephrases what the customer said; it never invents.
+
+**What the fix must not do.** Normalizing *wording* is in scope. Deciding
+*which device* the customer means is not — that is the gate's separate
+precision problem (L17), and a condenser that guesses at products would
+make it worse. The prompt states that boundary explicitly.
+
+**Enabling was not one change.** Three guards independently suppressed
+first-turn condensation: the call-site `and history` condition, an early
+return inside `condense_query`, and a system prompt whose only stated job
+was resolving pronouns. Removing any one alone is a no-op (L18).
+
+### Decision
+
+Option F. Condensation now runs on every turn, including the first. The
+condenser prompt gained one job — rephrase casual or vague wording into
+the technical terms a support document would use — bounded by explicit
+instructions never to add topics or details the customer did not convey,
+and never to guess at a product or part they did not name. Fail-open
+behaviour, the ADR-004 transcript rendering, and the rule that the
+*agent* always receives the raw message are all unchanged.
+
+### Verification
+
+Round-3 matched pairs, re-run unchanged against the new pipeline, each as
+a fresh session so the first-message path is what gets exercised:
+
+| Topic | Customer-phrased, before | After | Doc-phrased twin |
+|---|---|---|---|
+| CFM, gas range | 0.4606 ❌ | **0.3740 ✅** | 0.3782 |
+| CFM, electric range | 0.4039 ✅ | 0.4291 ✅ | 0.3768 |
+| Duct size | 0.4852 ❌ | **0.3860 ✅** | 0.3517 |
+| Duct diameter | 0.5040 ❌ | **0.3711 ✅** | 0.3633 |
+| Duct material | 0.6019 ❌ | 0.6066 ❌ | 0.4819 ❌ |
+| Makeup air | 0.5208 ❌ | 0.5384 ❌ | 0.3590 |
+
+**Customer-phrased questions passing: 1 of 6 → 4 of 6.** No
+documentation-phrased question regressed.
+
+An unplanned control validated the measurement: the duct-material doc
+question was already precise, so the condenser returned it
+character-for-character unchanged — and it scored 0.48187 before,
+0.48191 after. A four-decimal match on unchanged text shows the pipeline
+introduces no measurement noise of its own.
+
+The two remaining failures are not phrasing failures, and they are not
+the same failure as each other. *Duct material* fails in **both**
+phrasings, so the content is missing from the corpus and no rewrite can
+supply it. *Makeup air* fails because the condenser rewrites blind: it
+has no access to the knowledge base, so it can normalize general
+technical register ("pipe"→"duct" is ordinary English) but cannot map a
+customer's description onto a term of art it was never told exists. It
+produced a fluent paraphrase that never reached "makeup air", whose doc
+twin scores 0.3590.
+
+### Pros
+
+- The measured failure is largely repaired, on evidence rather than on
+  intuition about thresholds.
+- No new component, no new dependency, no change to the gate's cheap
+  one-embed-one-lookup shape.
+- Reuses a module already proven safe in production since ADR-001,
+  including its fail-open behaviour.
+- The rewrite still never reaches the answering agent, so a distorted
+  rewrite can at worst cause a wrong gate verdict, never a wrong answer
+  in the customer's name.
+
+### Cons — accepted knowingly
+
+- Every turn now pays one cheap-model call, not just follow-ups —
+  roughly 0.8–1.0s and ~$0.0001 per turn, measured.
+- Rewriting is non-deterministic: two near-identical questions received
+  "pipe"→"duct" in one case and kept "vent pipe" in another. The fix
+  raises the average, it does not guarantee any single question.
+- One customer phrasing moved the wrong way (0.4039 → 0.4291). It still
+  passes, but the change is not uniformly beneficial.
+- Rewriting toward documentation vocabulary plausibly pushes wrong-device
+  questions closer to the corpus too, which the gate's separate precision
+  problem (L17) will have to absorb.
+
+### Learnings
+
+- Measure before choosing. The threshold fix was the obvious candidate
+  and the measurement is what ruled it out — overlapping distributions
+  cannot be separated by moving a line.
+- The most-used technique and the right technique are different
+  questions. Hybrid search is the industry's default answer to retrieval
+  quality and is the wrong instrument for a pure register gap.
+- When two fixes both use a model call, "uses an LLM" is not the cost
+  that separates them — what already exists, and what must be built and
+  maintained, is.
+- A capability gap and a call-site guard look identical from the outside
+  ("it still doesn't work") and need different fixes.
+- A control you did not plan can be the strongest evidence you get: an
+  unchanged input scoring an unchanged distance proved the measurement
+  stable in a way no designed test did.
+- **A domain glossary in the condenser prompt was evaluated and
+  deliberately deferred.** It would likely fix the makeup-air class by
+  giving the condenser the vocabulary it lacks. It was not adopted
+  because it aggravates the gate's precision problem at the worst layer:
+  teaching the condenser range-hood vocabulary invites it to rewrite
+  wrong-device questions into range-hood terms, pushing them past the
+  *cheap* stage-5 gate and leaving only the expensive stage-6 agent to
+  refuse them — inverting the fail-cheap ordering the pipeline is built
+  on. It is a second-order decision that should be made after the
+  precision fix lands and can be measured against it, and grounded in the
+  corpus's real vocabulary rather than guessed terms.
+
+---
+
 ## ADR-008 — Asking for a human is never out of scope: escalate from inside the relevance-gate refusal
 
 **Date:** 2026-08-24 · **Status:** Accepted, implemented · **Files:** `app/api/routes/chat.py`, `app/static/demo.html` · **Companion to:** learnings L14, L15
 
-> ADR-007 is deliberately reserved for the relevance-gate boundary decision,
-> which is blocked on measurement. This entry was written first; the IDs are
-> stable labels, not a timeline.
+> ADR-007 was reserved for the relevance-gate boundary decision, which was
+> blocked on measurement at the time this entry was written. This entry was
+> written first and 007 filled later; the IDs are stable labels, not a
+> timeline.
 
 ### The problem
 

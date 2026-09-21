@@ -6,8 +6,9 @@ the conversation history. The relevance gate then embeds the rewritten
 query, fixing the gate's history-blindness.
 
 This is the standard production "history-aware retrieval" pattern. Uses
-ChatbotSettings.cheap_model (gpt-4o-mini) — one small call per follow-up
-turn; first turns skip condensation entirely.
+ChatbotSettings.cheap_model (gpt-4o-mini) — one small call every turn,
+including the first: even a standalone first message can use casual
+wording that lands far from the documentation in embedding space.
 
 Design notes:
 - History is rendered as a plain-text transcript into the prompt, NOT
@@ -43,15 +44,22 @@ logger = logging.getLogger(__name__)
 _cs = get_settings().chatbot
 
 CONDENSER_SYSTEM_PROMPT = """\
-You rewrite a customer's latest chat message into ONE standalone,
-self-contained question, using the conversation transcript to resolve
+You rewrite a customer's latest chat message into ONE standalone, clear
+question. If a conversation transcript is provided, use it to resolve
 references like "that", "it", or "the second one".
+
+You also rephrase casual or vague wording into the more precise technical
+terms a support document would use for the same meaning — for example,
+"the vent pipe" -> "the duct", or "it's really loud" -> "it is making
+excessive noise". Only do this when the customer's own words already
+convey that meaning.
 
 Rules:
 - Output ONLY the rewritten question. No preamble, no quotes, no notes.
-- Preserve the customer's intent exactly. Never add topics, assumptions,
-  or details that are not in the message or the transcript.
-- If the message is already self-contained, return it unchanged.
+- Preserve the customer's intent exactly. Never add topics, products, or
+  details that are not already in the message or the transcript. Do not
+  guess at a specific product or part the customer did not name.
+- If the message is already clear and precise, return it unchanged.
 """
 
 # Module-level singleton, mirroring agent.py Decision C1. No tools, no
@@ -91,22 +99,20 @@ async def condense_query(
     message: str,
     history: list[ModelMessage],
 ) -> str:
-    """Return a standalone version of `message`, or `message` itself.
+    """Return a standalone, vocabulary-normalized version of `message`.
 
-    First turns (empty history) skip the LLM call entirely. Fails open:
-    any error returns the raw message.
+    Runs on every turn, including the first — see module docstring.
+    Fails open: any error returns the raw message.
     """
-    if not history:
-        return message
-
     transcript = _render_transcript(history)
-    if not transcript:
-        return message
 
-    prompt = (
-        f"Conversation transcript:\n{transcript}\n\n"
-        f"Latest customer message:\n{message}"
-    )
+    if transcript:
+        prompt = (
+            f"Conversation transcript:\n{transcript}\n\n"
+            f"Latest customer message:\n{message}"
+        )
+    else:
+        prompt = f"Customer message:\n{message}"
 
     try:
         result = await condenser_agent.run(prompt)

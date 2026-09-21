@@ -800,3 +800,135 @@ and letting it apply to the case you didn't.
 Corollary, from how this one was nearly kept: if the reason a field keeps its
 current value is that changing it would make a screenshot look worse, that is
 not a reason. It is the screenshot asking to be re-taken.
+
+---
+
+## L16. "Uses an LLM" is not the cost that matters when comparing two fixes
+
+Asked while ranking candidate fixes for the vocabulary-mismatch problem
+(ADR-007, still open): query rewriting and reranking were both described as
+"using a small LLM" — so why call one more efficient than the other?
+
+### The mistake the question catches
+
+It is natural to sort fixes into "adds an LLM call" vs. "doesn't," and stop
+there. That axis is the wrong one here — query rewriting and reranking both
+make a model call. Judging them on whether an LLM is involved treats two
+fixes with very different real costs as if they were the same.
+
+### The two axes that actually matter
+
+**1. Does the fix reuse something already built, or does it require new
+infrastructure?**
+
+Query rewriting is not a new component — it is `condenser.py`, live since
+ADR-001, already proven safe in production. Extending it to run on first
+messages (not just follow-ups) is a small change to code that already
+exists: relax one `if history:` guard. Reranking exists nowhere in this
+stack today — no reranker model, no reranker library, nothing in
+`settings.py`. Adopting it means choosing one, integrating it, and
+maintaining it: a new component, not an extension of a proven one.
+
+**2. How many calls does the fix add per turn, and does it change the
+shape of the pipeline around it?**
+
+Query rewriting adds exactly one small-model call per turn. Its output — one
+rewritten sentence — flows straight into the relevance gate exactly as it
+works today: one embed, one top-1 lookup (Decision E2). Nothing about the
+gate's shape changes.
+
+Reranking cannot work against a single candidate — it has to score several
+candidate chunks against the query, every turn. That means retrieving a
+wider candidate set first, which the gate does not do today, and then a
+comparison per candidate. So reranking is not "one more call instead of
+zero" — it is several calls, every turn, plus a restructuring of the gate
+itself before there is anything to rerank.
+
+### The general principle
+
+When comparing two fixes that both involve a model call, "does it use an
+LLM" is not a cost signal — nearly every fix at this layer does. The costs
+that actually separate them are (a) how much of the fix already exists
+versus must be built and maintained from scratch, and (b) how many calls it
+adds per turn and whether it forces a change to the shape of the pipeline
+around it, versus slotting into the shape that is already there.
+
+*Recorded as reasoning that fed the fix direction for ADR-007, not yet a
+final decision — ADR-007 itself is written once the fix is confirmed
+(per the ADR-001 meta-lesson: don't write the ADR while still leaning).*
+
+---
+
+## L17. One gate, two opposite failures — they need two different fixes
+
+Noticed while scoping the condenser fix: the gate doesn't only reject
+on-topic questions asked in customer language. It also *accepts* off-topic
+questions that happen to share vocabulary with the range hood docs — a
+customer asking about a bathroom fan or attic fan, not the Viking range hood
+at all. Same gate, opposite direction of error.
+
+**Failure 1 — same topic, different words, pushed apart.**
+*"What about ductwork for that?"* vs. *"What ductwork is required for a
+range hood?"* — both about the range hood, but phrased differently, so they
+land far apart in embedding space and the true match gets rejected. This is
+a **recall** problem: the gate is too strict on wording it doesn't recognize.
+Fix: query rewriting (the condenser), which restates the question so the
+topic lands where it should.
+
+**Failure 2 — different topics, shared words, pulled together.**
+*"What CFM do I need for my attic fan?"* scores 0.4371 — close enough to
+pass — because "CFM," "fan," and "airflow" appear in the range hood docs
+too, even though an attic fan is a different device entirely. This is a
+**precision** problem: the gate is too loose on words it does recognize.
+Fix: system-prompt scoping — tell the agent it only answers Viking range
+hood questions, not fans in general, even when retrieval looks close.
+
+**Why one fix can't do both.** Query rewriting's job is to restate what the
+customer already meant, not to decide which device they meant. Worse: if it
+leans harder toward the docs' own vocabulary to fix Failure 1, it could pull
+an attic-fan question even closer to a false accept in Failure 2 — the fix
+for one failure quietly feeding the other. Keep them as two separate
+changes, tested one at a time, so a regression can be traced to the change
+that caused it.
+
+**General principle:** a gate that rejects some right answers and accepts
+some wrong ones isn't one bug — it's two opposite failures wearing the same
+symptom. Fix each with the tool built for its direction (recall vs.
+precision), not one fix stretched to cover both.
+
+---
+
+## L18. Turning on a fix in one place doesn't help if two other guards still block it
+
+Scoping the condenser extension (run it on turn one too, not just
+follow-ups) surfaced this: the guard that skips it isn't in one place — it's
+in three.
+
+- `chat.py` only *calls* the condenser `if ... and history:` — turn one
+  never gets there.
+- `condense_query()` itself returns the raw message unchanged whenever
+  `history` is empty — a second wall, even if the first one is opened.
+- The condenser's *instructions* only ever asked it to resolve references
+  like "that" or "it" using the transcript. A first message has neither
+  pronouns nor a transcript, so — even past both walls — today's prompt
+  would just hand it back unchanged. It was never told to also normalize
+  vocabulary; that's a different job it's never been asked to do.
+
+Example of why all three matter: *"my thing under the stove is making
+noise"* on turn one, no history. Removing wall 1 and 2 alone still returns
+that sentence unchanged, because nothing told the model to rephrase it
+toward *"range hood noise"* — the model isn't failing, it's doing exactly
+the (narrower) job it was given.
+
+**General principle:** when a fix "isn't happening," check for more than
+one gate before assuming the first one you removed was the only one. And
+separately: enabling a component on more inputs is not the same change as
+teaching it a new task — a call-site guard and a capability gap look
+identical from the outside ("it still doesn't work") but need different
+fixes.
+
+**Trade-off noted alongside this fix:** running the condenser on every turn
+instead of only follow-ups roughly doubles how often that model call
+happens. Flagged against the separate, still-open ~30-second latency
+question (Roadmap item 3) — worth remeasuring latency right after this
+change lands, so it's a known data point rather than a confound.
